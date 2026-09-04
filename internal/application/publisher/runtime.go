@@ -22,7 +22,7 @@ type Runtime interface {
 // Probe old assets as well: a route accidentally rooted at latest/assets must fail
 // activation before it can strand browsers that loaded the previous index.
 func (r *Runner) verifyRetainedAssets(ctx context.Context, t config.Target, base *os.Root, st *state.TargetState, current *state.Record) error {
-	if t.Type != release.ReleaseTypeFrontendStatic {
+	if t.Type != release.ReleaseTypeFrontendStatic || !t.SharedAssets {
 		return nil
 	}
 	versions := map[string]*state.Version{}

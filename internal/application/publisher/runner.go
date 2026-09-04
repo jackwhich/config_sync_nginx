@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/http"
 	"nginx_updata_config/internal/infrastructure/nginx"
+	"nginx_updata_config/internal/infrastructure/oras"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,17 +27,21 @@ import (
 
 // Runner executes one synchronous transaction at a time across every target on a node.
 // JSON snapshots published in views are immutable; only the lock owner mutates transactions.
+type ArtifactSource interface {
+	Pull(context.Context, config.Target, string, string) (string, error)
+}
 type Runner struct {
-	cfg      config.Config
-	git      git.Client
-	runtime  Runtime
-	store    *statestore.Store
-	nodeLock *lock.Lock
-	busy     chan struct{}
-	mu       sync.RWMutex
-	views    map[string]*state.TargetState
-	blocked  string
-	stopping bool
+	artifacts ArtifactSource
+	cfg       config.Config
+	git       git.Client
+	runtime   Runtime
+	store     *statestore.Store
+	nodeLock  *lock.Lock
+	busy      chan struct{}
+	mu        sync.RWMutex
+	views     map[string]*state.TargetState
+	blocked   string
+	stopping  bool
 }
 
 func New(cfg config.Config) (*Runner, error) { return NewWithRuntime(cfg, &nginx.Runtime{Config: cfg}) }
@@ -50,7 +55,7 @@ func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 		store.Close()
 		return nil, e
 	}
-	r := &Runner{cfg: cfg, git: git.Client{DataDir: cfg.DataDir, Repos: cfg.Repos, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, runtime: rt, store: store, nodeLock: nl, busy: make(chan struct{}, 1), views: map[string]*state.TargetState{}}
+	r := &Runner{cfg: cfg, artifacts: oras.Client{Config: cfg.ORAS, DataDir: cfg.DataDir, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, git: git.Client{DataDir: cfg.DataDir, Repos: cfg.Repos, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, runtime: rt, store: store, nodeLock: nl, busy: make(chan struct{}, 1), views: map[string]*state.TargetState{}}
 	for _, t := range cfg.Targets {
 		prom.InitTarget(cfg.Env, string(t.Type), t.ID)
 	}
@@ -220,7 +225,7 @@ func (r *Runner) Health() map[string]any {
 		}
 	}
 	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
-	return map[string]any{"status": "ok", "release_contract": 2, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
+	return map[string]any{"status": "ok", "release_contract": 2, "capabilities": []string{release.FrontendORASCapability}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
 }
 func (r *Runner) Target(id string) (config.Target, bool) {
 	for _, t := range r.cfg.Targets {
@@ -251,7 +256,7 @@ func (r *Runner) State(id, releaseID string) (map[string]any, int, error) {
 		}
 	}
 	r.mu.RUnlock()
-	out := map[string]any{"release_contract": 2, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
+	out := map[string]any{"release_contract": 2, "capabilities": []string{release.FrontendORASCapability}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
 	if st.Current != nil {
 		out["current_commit_id"] = st.Current.CommitID
 	}
@@ -323,10 +328,11 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		req.Project = t.Project
 	}
 	req.Version = release.EffectiveVersion(req)
+	source := r.source(req, t)
 	fingerprint := release.Digest(struct {
 		Request      release.ApplyRequest
 		Target, Repo string
-	}{req, t.ID, r.cfg.Repos[req.SourceRepo].URL})
+	}{req, t.ID, source})
 	if result, ok := r.duplicate(req, fingerprint); ok {
 		return result
 	}
@@ -375,10 +381,13 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 			return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "restore requires the successful release's retained baseline and unchanged resulting revision")
 		}
 	}
+	if req.RestoreOf != "" && req.Type == release.ReleaseTypeFrontendStatic && st.Records[req.RestoreOf].Baseline.ArtifactDigest != req.ArtifactDigest {
+		return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "artifact digest must match the recorded local baseline")
+	}
 	prom.Active(r.cfg.Env, string(t.Type), t.ID, true)
 	defer prom.Active(r.cfg.Env, string(t.Type), t.ID, false)
 	rec := &state.Record{Request: req, Fingerprint: fingerprint, Baseline: st.Current, BaselinePrevious: st.Previous, HTTPStatus: 409}
-	rec.Result = release.Result{ReleaseID: req.ReleaseID, TargetID: t.ID, Env: req.Env, Type: req.Type, Project: req.Project, ServerName: t.ServerName, Version: req.Version, CommitID: req.CommitID, Status: release.NodeStatusRunning, Phase: "accepted", ActivationStatus: "unchanged", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}
+	rec.Result = release.Result{ArtifactDigest: req.ArtifactDigest, ReleaseID: req.ReleaseID, TargetID: t.ID, Env: req.Env, Type: req.Type, Project: req.Project, ServerName: t.ServerName, Version: req.Version, CommitID: req.CommitID, Status: release.NodeStatusRunning, Phase: "accepted", ActivationStatus: "unchanged", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}
 	if st.Current != nil {
 		rec.Result.PreviousCommitID = st.Current.CommitID
 	}
@@ -417,7 +426,7 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		}
 		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
 	}
-	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == r.cfg.Repos[req.SourceRepo].URL {
+	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == source {
 		rec.Result.Status = release.NodeStatusSkipped
 		rec.Result.Phase = "complete"
 		rec.Result.FinishedAt = time.Now().UTC()
@@ -436,9 +445,18 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		e = r.step(prep, st, rec, "prepare_snapshot", func(c context.Context) error { _, e := verifySnapshot(c, base, rec.Candidate); return e })
 	} else {
 		var work, actual string
-		e = r.step(prep, st, rec, "fetch", func(c context.Context) error {
+		fetchStep := "fetch"
+		if req.Type == release.ReleaseTypeFrontendStatic {
+			fetchStep = "oras_pull"
+		}
+		e = r.step(prep, st, rec, fetchStep, func(c context.Context) error {
 			var err error
-			work, actual, err = r.git.Checkout(c, req.SourceRepo, req.Branch, req.CommitID, t.ServerName)
+			if req.Type == release.ReleaseTypeFrontendStatic {
+				actual = req.CommitID
+				work, err = r.artifacts.Pull(c, t, req.CommitID, req.ArtifactDigest)
+			} else {
+				work, actual, err = r.git.Checkout(c, req.SourceRepo, req.Branch, req.CommitID, t.ServerName)
+			}
 			return err
 		})
 		if work != "" {
@@ -447,7 +465,7 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		if e == nil {
 			e = r.step(prep, st, rec, "prepare_snapshot", func(c context.Context) error {
 				var err error
-				rec.Candidate, err = prepareSnapshot(c, r.cfg, t, work, actual, r.cfg.Repos[req.SourceRepo].URL, req.Version)
+				rec.Candidate, err = prepareSnapshot(c, r.cfg, t, work, actual, source, req.Version)
 				return err
 			})
 		}
@@ -485,10 +503,10 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		}
 		return fsutil.Switch(base, rec.Candidate.Link)
 	})
-	if e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+	if e == nil {
 		e = r.step(critical, st, rec, "nginx_test", r.runtime.Test)
 	}
-	if e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+	if e == nil {
 		e = r.step(critical, st, rec, "reload", r.runtime.Reload)
 	}
 	if e == nil {
@@ -559,6 +577,9 @@ func (r *Runner) result(rec *state.Record) release.Result {
 		prom.Terminal(r.cfg.Env, string(result.Type), result.TargetID, string(result.Status))
 	}
 	fields := map[string]any{"env": r.cfg.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
+	if result.ArtifactDigest != "" {
+		fields["artifact_digest"] = result.ArtifactDigest
+	}
 	if result.Status == release.NodeStatusFailed || result.Status == release.NodeStatusRecoveryRequired {
 		fields["error"] = result.Error
 		applog.LogError("发布执行失败", "release_result", fields)
@@ -673,13 +694,11 @@ func (r *Runner) restoreLocal(ctx context.Context, t config.Target, base *os.Roo
 	if e := fsutil.Switch(base, rec.BeforeLink); e != nil {
 		return e
 	}
-	if t.Type != release.ReleaseTypeFrontendStatic {
-		if e := r.runtime.Test(ctx); e != nil {
-			return e
-		}
-		if e := r.runtime.Reload(ctx); e != nil {
-			return e
-		}
+	if e := r.runtime.Test(ctx); e != nil {
+		return e
+	}
+	if e := r.runtime.Reload(ctx); e != nil {
+		return e
 	}
 	return r.verify(ctx, t, base, rec.Baseline)
 }
@@ -713,7 +732,7 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 		return
 	}
 	if rec.Candidate != nil && link == rec.Candidate.Link {
-		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil {
 			e = r.runtime.Test(ctx)
 			if e == nil {
 				e = r.runtime.Reload(ctx)
@@ -775,4 +794,11 @@ func (r *Runner) cleanupExport(t config.Target, work string) {
 		prom.CleanupFailure(r.cfg.Env, string(t.Type), t.ID)
 		applog.LogWarn("导出临时目录清理未完成", "cleanup_warning", map[string]any{"target_id": t.ID, "error": e.Error()})
 	}
+}
+
+func (r *Runner) source(req release.ApplyRequest, t config.Target) string {
+	if req.Type == release.ReleaseTypeFrontendStatic {
+		return t.ArtifactRepository + "@" + req.ArtifactDigest
+	}
+	return r.cfg.Repos[req.SourceRepo].URL
 }

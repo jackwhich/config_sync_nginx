@@ -19,14 +19,17 @@ import (
 	"nginx_updata_config/internal/domain/state"
 )
 
-func frontendFixture(t *testing.T) (*fixture, *atomic.Bool) {
+func frontendFixture(t *testing.T) (*fixture, *atomic.Bool) { return frontendFixtureMode(t, true) }
+func frontendFixtureMode(t *testing.T, shared bool) (*fixture, *atomic.Bool) {
 	f := newFixture(t)
 	f.r.Close()
 	f.r = nil
 	f.cfg.Targets[0].Type = release.ReleaseTypeFrontendStatic
-	f.cfg.Repos["frontend_static"] = f.cfg.Repos["config"]
+	f.cfg.Targets[0].ArtifactRepository = "harbor.example.com/test/site-dist"
+	f.cfg.Targets[0].SharedAssets = shared
+	f.cfg.ORAS = config.ORAS{Binary: "/usr/local/bin/oras", RegistryConfig: "/etc/oras/auth.json"}
 	f.cfg.AssetRetention = config.Duration(7 * 24 * time.Hour)
-	targetDir := filepath.Join(f.cfg.Targets[0].PathDest, "frontend_static", "site")
+	targetDir := filepath.Join(f.cfg.Targets[0].PathDest, "site")
 	wrongRoute := &atomic.Bool{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		relative := strings.TrimPrefix(r.URL.Path, "/")
@@ -34,7 +37,7 @@ func frontendFixture(t *testing.T) (*fixture, *atomic.Bool) {
 			relative = "index.html"
 		}
 		root := filepath.Join(targetDir, "latest")
-		if strings.HasPrefix(relative, "assets/") && !wrongRoute.Load() {
+		if shared && strings.HasPrefix(relative, "assets/") && !wrongRoute.Load() {
 			root = targetDir
 		}
 		data, e := os.ReadFile(filepath.Join(root, relative))
@@ -54,6 +57,7 @@ func frontendFixture(t *testing.T) (*fixture, *atomic.Bool) {
 		t.Fatal(e)
 	}
 	f.r = r
+	r.artifacts = fixtureArtifacts{f}
 	return f, wrongRoute
 }
 func (f *fixture) frontendCommit(body, extra string) (string, string) {
@@ -87,6 +91,7 @@ func (f *fixture) frontendCommit(body, extra string) (string, string) {
 func frontendRequest(f *fixture, id string) release.ApplyRequest {
 	req := f.request(id)
 	req.Type = release.ReleaseTypeFrontendStatic
+	req.ArtifactDigest = "sha256:" + release.Digest(id)
 	return req
 }
 func TestFrontendOldAssetsRemainAvailableAndProtected(t *testing.T) {
@@ -234,7 +239,96 @@ func TestFrontendStartupDoesNotCommitBrokenOldAssetRoute(t *testing.T) {
 	}()
 	f.restart()
 	st, link := f.current()
-	if st.Current.CommitID != a || link != "releases/"+a || st.RecoveryRequired {
+	if st.Current.CommitID != a || link != a || st.RecoveryRequired {
 		t.Fatalf("startup accepted broken asset route: %+v %s", st, link)
+	}
+}
+
+// Test artifact source exports fixture bytes; production frontend never selects Git.
+type fixtureArtifacts struct{ f *fixture }
+
+func (a fixtureArtifacts) Pull(ctx context.Context, t config.Target, commit, digest string) (string, error) {
+	work, _, err := a.f.r.git.Checkout(ctx, "config", "main", commit, t.ServerName)
+	return work, err
+}
+
+type unavailableArtifacts struct{}
+
+func (unavailableArtifacts) Pull(context.Context, config.Target, string, string) (string, error) {
+	return "", os.ErrNotExist
+}
+
+func TestFrontendDistLayoutDigestAndOfflineRestore(t *testing.T) {
+	f, _ := frontendFixtureMode(t, false)
+	plain := func(body string) string {
+		site := filepath.Join(f.repo, "site")
+		if err := os.MkdirAll(site, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(site, "index.html"), []byte(`<script src="/app.js"></script>`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(site, "app.js"), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, f.repo, "add", "-A")
+		gitRun(t, f.repo, "commit", "-m", "plain dist")
+		return gitRun(t, f.repo, "rev-parse", "HEAD")
+	}
+	a := plain("console.log('A')")
+	first := f.r.Apply(context.Background(), frontendRequest(f, a))
+	if first.Status != release.NodeStatusSucceeded {
+		t.Fatal(first)
+	}
+	target := f.cfg.Targets[0]
+	if target.Dir != filepath.Join(target.PathDest, "site") {
+		t.Fatal(target.Dir)
+	}
+	st, link := f.current()
+	if link != a || st.Current.ArtifactDigest != first.ArtifactDigest {
+		t.Fatalf("unexpected layout/digest: %s %+v", link, st.Current)
+	}
+	if _, err := os.Stat(filepath.Join(target.Dir, "releases")); !os.IsNotExist(err) {
+		t.Fatal("frontend unexpectedly used releases directory")
+	}
+	if _, err := os.Stat(filepath.Join(target.Dir, a, "index.html")); err != nil {
+		t.Fatal(err)
+	}
+	b := plain("console.log('B')")
+	second := f.r.Apply(context.Background(), frontendRequest(f, b))
+	if second.Status != release.NodeStatusSucceeded {
+		t.Fatal(second)
+	}
+	// One Git SHA may never be reused for a different artifact snapshot.
+	changed := frontendRequest(f, b)
+	changed.ArtifactDigest = "sha256:" + strings.Repeat("f", 64)
+	if result := f.r.Apply(context.Background(), changed); result.Status != release.NodeStatusFailed {
+		t.Fatal(result)
+	}
+	f.r.artifacts = unavailableArtifacts{}
+	// Rollback must use the recorded old digest and local bytes without Harbor.
+	rollback := frontendRequest(f, a)
+	rollback.RestoreOf = second.ReleaseID
+	wrong := rollback
+	wrong.ArtifactDigest = second.ArtifactDigest
+	if got := f.r.Apply(context.Background(), wrong); got.ErrorCode != "RESTORE_BASELINE_CONFLICT" {
+		t.Fatal(got)
+	}
+	result := f.r.Apply(context.Background(), rollback)
+	if result.Status != release.NodeStatusSucceeded {
+		t.Fatal(result)
+	}
+	_, link = f.current()
+	if link != a {
+		t.Fatal(link)
+	}
+	// A failed pull must leave latest at the verified old version.
+	result = f.r.Apply(context.Background(), frontendRequest(f, b))
+	if result.Status != release.NodeStatusFailed {
+		t.Fatal(result)
+	}
+	_, link = f.current()
+	if link != a {
+		t.Fatal(link)
 	}
 }

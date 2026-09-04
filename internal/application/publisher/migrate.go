@@ -32,7 +32,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 		return fmt.Errorf("configured target_id and full commit required")
 	}
 	if target.Type == release.ReleaseTypeFrontendStatic {
-		return fmt.Errorf("frontend migration requires the shared /assets route first; deploy to a new empty target and switch the entry route explicitly")
+		return fmt.Errorf("frontend ORAS migration requires a new empty target and explicit Nginx root cutover; old Git snapshots are not adopted")
 	}
 	nl, e := lock.Open(cfg.LockFile)
 	if e != nil {

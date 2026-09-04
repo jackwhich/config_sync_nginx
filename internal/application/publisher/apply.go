@@ -38,6 +38,9 @@ func openTarget(t config.Target) (*os.Root, error) {
 	}
 	defer root.Close()
 	sub := filepath.Join(string(t.Type), t.ServerName)
+	if t.Type == release.ReleaseTypeFrontendStatic {
+		sub = t.ServerName
+	}
 	if e = fsutil.EnsureDirs(root, sub, 0755); e != nil {
 		return nil, e
 	}
@@ -114,14 +117,14 @@ func verifySnapshot(ctx context.Context, base *os.Root, v *state.Version) (*stat
 	if v == nil {
 		return nil, fmt.Errorf("missing snapshot")
 	}
-	if v.Link != "releases/"+v.CommitID {
+	if v.Link != "releases/"+v.CommitID && v.Link != v.CommitID {
 		return nil, fmt.Errorf("invalid snapshot link")
 	}
 	m, e := loadManifest(base, v.CommitID)
 	if e != nil {
 		return nil, e
 	}
-	if m.Source != v.Source || manifestDigest(m) != v.ManifestDigest {
+	if m.Source != v.Source || artifactDigest(v.Source) != v.ArtifactDigest || manifestDigest(m) != v.ManifestDigest {
 		return nil, fmt.Errorf("snapshot source or manifest changed")
 	}
 	root, e := base.OpenRoot(v.Link)
@@ -165,19 +168,23 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, e
 	}
 	defer base.Close()
-	for _, dir := range []string{".staging", "releases", ".manifests"} {
+	dirs := []string{".staging", ".manifests"}
+	if t.Type != release.ReleaseTypeFrontendStatic {
+		dirs = append(dirs, "releases")
+	}
+	for _, dir := range dirs {
 		if e = fsutil.EnsureDirs(base, dir, 0755); e != nil {
 			return nil, e
 		}
 	}
 	if m, e := loadManifest(base, commit); e == nil {
-		v := &state.Version{CommitID: commit, Version: version, Source: source, Link: "releases/" + commit, ManifestDigest: manifestDigest(m)}
+		v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: t.SnapshotLink(commit), ManifestDigest: manifestDigest(m)}
 		_, e = verifySnapshot(ctx, base, v)
 		return v, e
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
-	if _, e = base.Lstat("releases/" + commit); e == nil {
+	if _, e = base.Lstat(t.SnapshotLink(commit)); e == nil {
 		return nil, fmt.Errorf("snapshot exists without a trusted manifest; recovery required")
 	}
 	src, e := os.OpenRoot(work)
@@ -226,7 +233,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if name == ".release-version" {
 			return fmt.Errorf("reserved .release-version file")
 		}
-		if t.Type == release.ReleaseTypeFrontendStatic && name == "frontend-manifest.json" {
+		if t.Type == release.ReleaseTypeFrontendStatic && t.SharedAssets && name == "frontend-manifest.json" {
 			return nil
 		}
 		f, err := hashFile(ctx, site, name)
@@ -259,7 +266,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		}
 	}
 	if t.Type == release.ReleaseTypeFrontendStatic {
-		if e = validateFrontend(ctx, site, m); e != nil {
+		if e = validateFrontend(ctx, site, m, t.SharedAssets); e != nil {
 			return nil, e
 		}
 	}
@@ -281,17 +288,17 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	if e = syncTree(dst); e != nil {
 		return nil, e
 	}
-	if e = base.Rename(stage, "releases/"+commit); e != nil {
+	if e = base.Rename(stage, t.SnapshotLink(commit)); e != nil {
 		return nil, e
 	}
-	if e = fsutil.SyncDir(base, "releases"); e != nil {
+	if e = fsutil.SyncDir(base, path.Dir(t.SnapshotLink(commit))); e != nil {
 		return nil, e
 	}
 	b, _ := json.Marshal(m)
 	if e = fsutil.AtomicWrite(base, ".manifests/"+commit+".json", b, 0600); e != nil {
 		return nil, e
 	}
-	v := &state.Version{CommitID: commit, Version: version, Source: source, Link: "releases/" + commit, ManifestDigest: manifestDigest(m)}
+	v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: t.SnapshotLink(commit), ManifestDigest: manifestDigest(m)}
 	return v, nil
 }
 func syncTree(root *os.Root) error {
@@ -316,7 +323,13 @@ func syncTree(root *os.Root) error {
 var hashName = regexp.MustCompile(`[.-][a-fA-F0-9]{8,64}(?:[.-]|$)`)
 var references = regexp.MustCompile(`(?:src=|href=|url\(|from\s+|import\s*\(|new URL\s*\()\s*["']?([^"'\s)>]+)|["']((?:\./|\.\./|/assets/|assets/)[^"'\s]+\.(?:js|css|png|jpg|jpeg|svg|webp|woff2?)(?:\?[^"']*)?)["']`)
 
-func validateFrontend(ctx context.Context, src *os.Root, m *state.Manifest) error {
+func validateFrontend(ctx context.Context, src *os.Root, m *state.Manifest, shared bool) error {
+	if f, ok := m.Files["index.html"]; !ok || f.Size == 0 {
+		return fmt.Errorf("nonempty index.html required")
+	}
+	if !shared {
+		return validateReferences(ctx, src, m.Files)
+	}
 	b, e := src.ReadFile("frontend-manifest.json")
 	if e != nil {
 		return fmt.Errorf("frontend-manifest.json required: %w", e)
@@ -342,15 +355,21 @@ func validateFrontend(ctx context.Context, src *os.Root, m *state.Manifest) erro
 				return fmt.Errorf("frontend file not declared as hashed asset: %s", name)
 			}
 		}
+	}
+	m.Assets = ci.Assets
+	return validateReferences(ctx, src, m.Files)
+}
+func validateReferences(ctx context.Context, src *os.Root, files map[string]state.File) error {
+	for name := range files {
 		ext := path.Ext(name)
 		if ext != ".html" && ext != ".css" && ext != ".js" {
 			continue
 		}
-		f := m.Files[name]
+		f := files[name]
 		if f.Size > 32<<20 {
 			return fmt.Errorf("text asset too large")
 		}
-		b, e = src.ReadFile(name)
+		b, e := src.ReadFile(name)
 		if e != nil {
 			return e
 		}
@@ -377,12 +396,11 @@ func validateFrontend(ctx context.Context, src *os.Root, m *state.Manifest) erro
 			if ext == "" || ext == ".html" {
 				continue
 			}
-			if _, ok := ci.Assets[p]; !ok {
+			if _, ok := files[p]; !ok {
 				return fmt.Errorf("undeclared frontend reference %s in %s", ref, name)
 			}
 		}
 	}
-	m.Assets = ci.Assets
 	return ctx.Err()
 }
 func installAssets(ctx context.Context, base *os.Root, v *state.Version, m *state.Manifest) error {
@@ -439,6 +457,9 @@ func cleanupSnapshots(ctx context.Context, c config.Config, t config.Target, st 
 	if e != nil {
 		return e
 	}
+	if release.IsCommit(link) {
+		protect[link] = true
+	}
 	if strings.HasPrefix(link, "releases/") {
 		protect[strings.TrimPrefix(link, "releases/")] = true
 	}
@@ -480,14 +501,14 @@ func cleanupSnapshots(ctx context.Context, c config.Config, t config.Target, st 
 			}
 			continue
 		}
-		if e = fsutil.RemoveTree(ctx, base, "releases/"+m.CommitID); e != nil {
+		if e = fsutil.RemoveTree(ctx, base, t.SnapshotLink(m.CommitID)); e != nil {
 			return e
 		}
 		if e = base.Remove(".manifests/" + m.CommitID + ".json"); e != nil {
 			return e
 		}
 	}
-	if t.Type == release.ReleaseTypeFrontendStatic {
+	if t.Type == release.ReleaseTypeFrontendStatic && t.SharedAssets {
 		e = fs.WalkDir(base.FS(), "assets", func(name string, d fs.DirEntry, e error) error {
 			if errors.Is(e, os.ErrNotExist) {
 				return nil
@@ -512,4 +533,12 @@ func cleanupSnapshots(ctx context.Context, c config.Config, t config.Target, st 
 		})
 	}
 	return e
+}
+
+func artifactDigest(source string) string {
+	_, digest, ok := strings.Cut(source, "@")
+	if ok && release.IsArtifactDigest(digest) {
+		return digest
+	}
+	return ""
 }

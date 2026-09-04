@@ -11,130 +11,50 @@ import (
 	"nginx_updata_config/internal/config"
 	"nginx_updata_config/internal/domain/state"
 	"nginx_updata_config/internal/infrastructure/process"
-	"os"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
-type Runtime struct {
-	Config        config.Config
-	beforeWorkers map[int]bool
-	reloaded      bool
-}
+// Runtime only invokes the nginx command already provided by the host's PATH.
+// Optional HTTP checks do not inspect or manage Nginx processes.
+type Runtime struct{}
 
-func (n *Runtime) args(extra ...string) []string {
-	a := []string{}
-	if n.Config.Nginx.ConfigFile != "" {
-		a = append(a, "-c", n.Config.Nginx.ConfigFile)
-	}
-	if n.Config.Nginx.Prefix != "" {
-		a = append(a, "-p", n.Config.Nginx.Prefix)
-	}
-	if n.Config.Nginx.GlobalDirectives != "" {
-		a = append(a, "-g", n.Config.Nginx.GlobalDirectives)
-	}
-	if n.Config.Nginx.ErrorLog != "" {
-		a = append(a, "-e", n.Config.Nginx.ErrorLog)
-	}
-	return append(a, extra...)
-}
 func (n *Runtime) Test(ctx context.Context) error {
-	_, e := process.Run(ctx, "", nil, nil, n.Config.Nginx.Binary, n.args("-t")...)
-	return e
-}
-func (n *Runtime) workers(ctx context.Context) (map[int]bool, error) {
-	master := n.Config.Nginx.MasterPID
-	if master == 0 {
-		b, e := os.ReadFile(n.Config.Nginx.PIDFile)
-		if e != nil {
-			return nil, e
-		}
-		master, e = strconv.Atoi(strings.TrimSpace(string(b)))
-		if e != nil || master <= 1 {
-			return nil, fmt.Errorf("invalid nginx master pid")
-		}
+	_, err := process.Run(ctx, "", nil, nil, "nginx", "-t")
+	if err != nil {
+		return fmt.Errorf("nginx -t: %w", err)
 	}
-	out, e := process.Run(ctx, "", nil, nil, "ps", "-eo", "pid=,ppid=,args=")
-	if e != nil {
-		return nil, e
-	}
-	pids := map[int]bool{}
-	masterFound := false
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 {
-			continue
-		}
-		pid, _ := strconv.Atoi(f[0])
-		parent, _ := strconv.Atoi(f[1])
-		if pid == master && strings.Contains(line, "nginx: master process") {
-			masterFound = true
-		}
-		if parent == master && strings.Contains(line, "nginx: worker process") && !strings.Contains(line, "shutting down") {
-			pids[pid] = true
-		}
-	}
-	if !masterFound || len(pids) == 0 {
-		return nil, fmt.Errorf("nginx master or active workers missing")
-	}
-	return pids, nil
+	return nil
 }
 func (n *Runtime) Reload(ctx context.Context) error {
-	p, e := n.workers(ctx)
-	if e != nil {
-		return e
+	_, err := process.Run(ctx, "", nil, nil, "nginx", "-s", "reload")
+	if err != nil {
+		return fmt.Errorf("nginx -s reload: %w", err)
 	}
-	n.beforeWorkers = p
-	n.reloaded = true
-	if n.Config.Nginx.MasterPID > 1 {
-		return syscall.Kill(n.Config.Nginx.MasterPID, syscall.SIGHUP)
-	}
-	_, e = process.Run(ctx, "", nil, nil, n.Config.Nginx.Binary, n.args("-s", "reload")...)
-	return e
+	return nil
 }
 func (n *Runtime) Verify(ctx context.Context, t config.Target, commit string, initial bool) error {
 	checks := t.HealthChecks
 	if initial {
 		checks = t.InitialHealthChecks
-		if len(checks) == 0 && !t.Dynamic {
-			return fmt.Errorf("initial baseline health checks not configured")
-		}
 	}
-	var last error
+	if len(checks) == 0 {
+		return ctx.Err()
+	}
 	for {
-		last = nil
-		{
-			p, e := n.workers(ctx)
-			last = e
-			if e == nil && n.reloaded {
-				fresh := false
-				for pid := range p {
-					if !n.beforeWorkers[pid] {
-						fresh = true
-					}
-				}
-				if !fresh {
-					last = fmt.Errorf("new nginx workers have not started")
-				}
+		var last error
+		for _, h := range checks {
+			if err := Probe(ctx, h, commit, ""); err != nil {
+				last = err
+				break
 			}
 		}
 		if last == nil {
-			for _, h := range checks {
-				if e := Probe(ctx, h, commit, ""); e != nil {
-					last = e
-					break
-				}
-			}
-		}
-		if last == nil {
-			n.reloaded = false
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("activation verification failed: %v: %w", last, ctx.Err())
+			return fmt.Errorf("HTTP verification failed: %v: %w", last, ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

@@ -19,6 +19,7 @@ type Manifest struct {
 	LastUsedAt time.Time         `json:"last_used_at"`
 }
 type Version struct {
+	ArtifactDigest string    `json:"artifact_digest,omitempty"`
 	CommitID       string    `json:"commit_id"`
 	Version        string    `json:"version"`
 	Source         string    `json:"source"`

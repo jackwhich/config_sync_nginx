@@ -97,9 +97,14 @@ def state_path(env, target_id=None, release_id=None, request=None):
     return "/api/v1/releases/state?" + urllib.parse.urlencode(query)
 
 
+def failure_detail(result):
+    # Preserve the server's command diagnostics for the Jenkins console and batch record.
+    return ": ".join(str(result[key]) for key in ("error_code", "error") if result.get(key)) or result.get("status", "request failed")
+
+
 def require(code, result, expected=200):
     if code != expected:
-        raise ReleaseError("HTTP %s: %s" % (code, result.get("error_code", result.get("error", "request failed"))))
+        raise ReleaseError("HTTP %s: %s" % (code, failure_detail(result)))
     return result
 
 
@@ -161,7 +166,7 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
                 node[result_key] = result
                 node["phase"] = "recovery_required"
                 atomic_save(path, batch)
-                raise ReleaseError("node requires recovery: " + node["url"])
+                raise ReleaseError("node requires recovery: " + node["url"] + ": " + failure_detail(result))
         elif code == 404 and not sent:
             # Write the exact ID/parameters before issuing the only side-effecting operation.
             node["phase"] = key + "_sending"
@@ -185,11 +190,11 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
                     node["phase"] = "rejected"
                     node["rejection"] = response
                     atomic_save(path, batch)
-                    raise ReleaseError("release rejected: " + response.get("error_code", str(status)))
+                    raise ReleaseError("release rejected: HTTP %s: %s" % (status, failure_detail(response)))
                 if response.get("status") == "recovery_required":
                     node[result_key] = response
                     atomic_save(path, batch)
-                    raise ReleaseError("node requires recovery: " + node["url"])
+                    raise ReleaseError("node requires recovery: " + node["url"] + ": " + failure_detail(response))
             continue
         elif code != 404:
             require(code, live)
@@ -229,7 +234,7 @@ def restore_batch(http, batch, path, resolve_timeout=120):
             atomic_save(path, batch)
         restored = execute_node(http, batch, node, path, "restore_request", "restore_result", resolve_timeout)
         if restored.get("status") != "succeeded":
-            raise ReleaseError("restoration failed on " + node["url"])
+            raise ReleaseError("restoration failed on " + node["url"] + ": " + failure_detail(restored))
     batch["phase"] = "restored"
     atomic_save(path, batch)
 
@@ -243,12 +248,15 @@ def update_batch(http, batch, path, resolve_timeout=120):
         for node in batch["nodes"]:
             result = execute_node(http, batch, node, path, resolve_timeout=resolve_timeout)
             if result.get("status") not in {"succeeded", "skipped"}:
-                raise ReleaseError("publication failed on " + node["url"])
+                raise ReleaseError("publication failed on " + node["url"] + ": " + failure_detail(result))
     except ReleaseError as exc:
         batch["phase"], batch["error"] = "incomplete", str(exc)
         atomic_save(path, batch)
         if batch["failure_policy"] == "restore":
-            restore_batch(http, batch, path, resolve_timeout)
+            try:
+                restore_batch(http, batch, path, resolve_timeout)
+            except ReleaseError as recovery_error:
+                raise ReleaseError("%s; batch restoration failed: %s" % (exc, recovery_error)) from recovery_error
         raise
     batch["phase"] = "succeeded"
     batch.pop("error", None)

@@ -1,10 +1,15 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,6 +25,7 @@ class FakeHTTP:
         self.drop_reply = False
         self.drop_query = False
         self.fail_node = None
+        self.failure = {"error_code": "NGINX_TEST_FAILED", "error": 'nginx -t: nginx: [emerg] unknown directive "bad_directive" in site.conf:7'}
         self.old_contract = None
         for name, old in (("http://a", "a" * 40), ("http://b", "b" * 40)):
             self.nodes[name] = {"revision": str(uuid.uuid4()), "commit": old, "records": {}, "target": name[-1] * 64}
@@ -47,6 +53,7 @@ class FakeHTTP:
         result = {"release_id": body["release_id"], "state_revision_before": node["revision"], "commit_id": body["commit_id"], "status": "succeeded"}
         if base == self.fail_node and "restore_of" not in body:
             result["status"] = "failed"
+            result.update(self.failure)
         else:
             node["commit"] = body["commit_id"]
             node["revision"] = str(uuid.uuid4())
@@ -55,7 +62,7 @@ class FakeHTTP:
         if self.drop_reply:
             self.drop_reply = False
             raise client.ReleaseError("response lost")
-        return 200, result
+        return (500 if result["status"] == "failed" else 200), result
 
 
 def batch(http):
@@ -111,6 +118,56 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.http.nodes["http://a"]["commit"], "a" * 40)
         self.assertEqual(len(self.http.calls), 3)
         self.assertEqual(self.http.calls[-1][0], "http://a")
+
+    def test_nginx_error_stops_next_node_and_preserves_diagnostics_on_resume(self):
+        self.http.fail_node = "http://a"
+        with self.assertRaisesRegex(client.ReleaseError, "NGINX_TEST_FAILED.*bad_directive.*site.conf:7"):
+            client.update_batch(self.http, self.batch, self.path)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["phase"], "incomplete")
+        self.assertIn(self.http.failure["error"], saved["error"])
+        with self.assertRaisesRegex(client.ReleaseError, "bad_directive"):
+            client.update_batch(self.http, saved, self.path)
+        self.assertEqual([url for url, _ in self.http.calls], ["http://a"])
+
+    def test_cli_exits_nonzero_and_prints_nginx_error(self):
+        http = self.http
+        http.fail_node = "http://a"
+
+        class Handler(BaseHTTPRequestHandler):
+            def reply(self, body=None):
+                _, name, path = self.path.split("/", 2)
+                code, result = http.call("http://" + name, "/" + path, body)
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode())
+
+            def do_GET(self):
+                self.reply()
+
+            def do_POST(self):
+                self.reply(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            for node in self.batch["nodes"]:
+                node["url"] = "http://127.0.0.1:%s/%s" % (server.server_port, node["node_id"])
+            client.atomic_save(self.path, self.batch)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                env = dict(os.environ, RELEASE_TOKEN="ci-test-token")
+                run = subprocess.run([sys.executable, str(Path(__file__).with_name("release_http.py")), "resume", "--batch-file", str(self.path)], env=env, capture_output=True, text=True, timeout=10)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("NGINX_TEST_FAILED", run.stderr)
+        self.assertIn(http.failure["error"], run.stderr)
+        self.assertEqual([url for url, _ in http.calls], ["http://a"])
 
     def test_batch_must_be_durable_before_post(self):
         with patch.object(client, "atomic_save", side_effect=OSError("disk full")):

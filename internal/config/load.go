@@ -34,15 +34,6 @@ type Repo struct {
 }
 type HealthCheck = target.HealthCheck
 
-type Nginx struct {
-	MasterPID        int    `yaml:"-"`
-	GlobalDirectives string `yaml:"-"`
-	ErrorLog         string `yaml:"-"`
-	Binary           string `yaml:"binary"`
-	ConfigFile       string `yaml:"config_file"`
-	Prefix           string `yaml:"prefix"`
-	PIDFile          string `yaml:"pid_file"`
-}
 type Target = target.Target
 
 type ORAS struct {
@@ -65,7 +56,6 @@ type Config struct {
 	ReleaseAuthTokens     map[string]string `yaml:"release_auth_tokens"`
 	Repos                 map[string]Repo   `yaml:"repos"`
 	Targets               []Target          `yaml:"targets"`
-	Nginx                 Nginx             `yaml:"nginx"`
 	AllowedClientIPs      []string          `yaml:"allowed_client_ips"`
 	TrustedProxyCIDRs     []string          `yaml:"trusted_proxy_cidrs"`
 	ExecutionTimeout      Duration          `yaml:"execution_timeout"`
@@ -208,7 +198,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("targets or a configured release repository is required")
 	}
 	seen := map[string]bool{}
-	needNginx := false
 	for i := range c.Targets {
 		t := &c.Targets[i]
 		t.Env = c.Env
@@ -222,9 +211,7 @@ func (c *Config) Validate() error {
 		}
 		switch t.Type {
 		case release.ReleaseTypeConfig, release.ReleaseTypeWhitelist:
-			needNginx = true
 		case release.ReleaseTypeFrontendStatic:
-			needNginx = true
 			repository := t.ArtifactRepository
 			if repository == "" {
 				repository = c.ORAS.Repository
@@ -286,9 +273,6 @@ func (c *Config) Validate() error {
 			}
 
 		}
-		if !t.IsTemplate() && len(t.HealthChecks) == 0 {
-			return fmt.Errorf("health_checks required for target %s", t.ServerName)
-		}
 		for j := range t.HealthChecks {
 			h := &t.HealthChecks[j]
 			if e = validateCheck(h); e != nil {
@@ -307,10 +291,10 @@ func (c *Config) Validate() error {
 			if t.SharedAssets && c.AssetRetention <= 0 {
 				return fmt.Errorf("frontend requires positive asset_retention")
 			}
-			if t.IsTemplate() && t.SharedAssets && t.PublicBaseURL == "" {
+			if t.SharedAssets && t.PublicBaseURL == "" {
 				return fmt.Errorf("shared_assets requires public_base_url")
 			}
-			if !t.IsTemplate() || t.PublicBaseURL != "" {
+			if t.PublicBaseURL != "" {
 				u, err := url.Parse(t.PublicBaseURL)
 				if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 					return fmt.Errorf("frontend requires public_base_url")
@@ -321,16 +305,6 @@ func (c *Config) Validate() error {
 			if !filepath.IsLocal(f) || strings.Contains(f, "\\") {
 				return fmt.Errorf("invalid required_files entry")
 			}
-		}
-	}
-	if needNginx {
-		for _, path := range []string{c.Nginx.Binary, c.Nginx.ConfigFile, c.Nginx.PIDFile} {
-			if path != "" && !filepath.IsAbs(path) {
-				return fmt.Errorf("optional nginx paths must be absolute")
-			}
-		}
-		if c.Nginx.Prefix != "" && !filepath.IsAbs(c.Nginx.Prefix) {
-			return fmt.Errorf("nginx prefix must be absolute")
 		}
 	}
 	c.Access, e = ParseIPAccessControl(c.AllowedClientIPs, c.TrustedProxyCIDRs)

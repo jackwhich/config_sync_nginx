@@ -40,8 +40,8 @@ targets:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.NodeID != "node-uat" || c.Env != "" || c.LockFile != filepath.Join(c.DataDir, "publish.lock") || c.Nginx.Binary != "" {
-		t.Fatalf("unexpected defaults: %+v", c.Nginx)
+	if c.NodeID != "node-uat" || c.Env != "" || c.LockFile != filepath.Join(c.DataDir, "publish.lock") {
+		t.Fatalf("unexpected defaults: node=%s env=%s lock=%s", c.NodeID, c.Env, c.LockFile)
 	}
 	for _, env := range []string{"uat", "prod"} {
 		target, err := c.TargetForEnv("frontend_static", "web", filepath.Join(root, "deploy"), "project", env)
@@ -52,7 +52,7 @@ targets:
 			t.Fatalf("bad target: %+v", target)
 		}
 	}
-	for _, body := range []string{yaml + "---\nunknown: true\n", strings.Replace(yaml, "  - config", "  - type: config\n    typo: true", 1), strings.Replace(yaml, "  - config", "  - type: config\n    health_checks:\n      - url: http://127.0.0.1\n        contains: ok\n        typo: true", 1), strings.Split(yaml, "targets:")[0] + "targets: []\n"} {
+	for _, body := range []string{yaml + "---\nunknown: true\n", yaml + "nginx:\n  pid_file: /run/nginx.pid\n", strings.Replace(yaml, "  - config", "  - type: config\n    typo: true", 1), strings.Replace(yaml, "  - config", "  - type: config\n    health_checks:\n      - url: http://127.0.0.1\n        contains: ok\n        typo: true", 1), strings.Split(yaml, "targets:")[0] + "targets: []\n"} {
 		if _, err := load(body); err == nil {
 			t.Fatal("invalid YAML accepted")
 		}

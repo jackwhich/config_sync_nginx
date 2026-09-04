@@ -41,7 +41,13 @@ type Nginx struct {
 }
 type Target = target.Target
 
+type ORAS struct {
+	Binary         string `yaml:"binary"`
+	RegistryConfig string `yaml:"registry_config"`
+	CAFile         string `yaml:"ca_file"`
+}
 type Config struct {
+	ORAS                  ORAS              `yaml:"oras"`
 	ListenAddr            string            `yaml:"listen_addr"`
 	NodeID                string            `yaml:"node_id"`
 	Env                   string            `yaml:"env"`
@@ -156,6 +162,16 @@ func (c *Config) Validate() error {
 		case release.ReleaseTypeConfig, release.ReleaseTypeWhitelist:
 			needNginx = true
 		case release.ReleaseTypeFrontendStatic:
+			needNginx = true
+			if e := ValidateArtifactRepository(t.ArtifactRepository); e != nil {
+				return e
+			}
+			if !filepath.IsAbs(c.ORAS.Binary) || !filepath.IsAbs(c.ORAS.RegistryConfig) {
+				return fmt.Errorf("frontend requires explicit absolute oras.binary and oras.registry_config")
+			}
+			if c.ORAS.CAFile != "" && !filepath.IsAbs(c.ORAS.CAFile) {
+				return fmt.Errorf("oras.ca_file must be absolute")
+			}
 		default:
 			return fmt.Errorf("unsupported target type")
 		}
@@ -167,6 +183,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("path_dest may not be filesystem root")
 		}
 		t.Dir = filepath.Join(t.PathDest, string(t.Type), t.ServerName)
+		if t.Type == release.ReleaseTypeFrontendStatic {
+			t.Dir = filepath.Join(t.PathDest, t.ServerName)
+		}
 		if fsutil.Within(t.Dir, c.LockFile) {
 			return fmt.Errorf("lock_file cannot reside within a deployment target")
 		}
@@ -190,23 +209,25 @@ func (c *Config) Validate() error {
 		if err != nil || v > 0777 || v&0022 != 0 {
 			return fmt.Errorf("file_mode must not permit group/world writes")
 		}
-		repo, ok := c.Repos[string(t.Type)]
-		if !ok {
-			return fmt.Errorf("missing repos.%s", t.Type)
-		}
-		u, err := url.Parse(repo.URL)
-		if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("invalid repository URL or embedded credentials")
-		}
-		if u.Scheme == "file" {
-			if !repo.AllowLocal || u.Host != "" || !filepath.IsAbs(u.Path) {
-				return fmt.Errorf("local repositories require allow_local and empty host")
+		if t.Type != release.ReleaseTypeFrontendStatic {
+			repo, ok := c.Repos[string(t.Type)]
+			if !ok {
+				return fmt.Errorf("missing repos.%s", t.Type)
 			}
-		} else if u.Scheme != "https" || u.Host == "" || repo.GitLabToken == "" {
-			return fmt.Errorf("repository requires https URL and gitlab_token")
-		}
-		if len(repo.AllowedBranches) == 0 {
-			return fmt.Errorf("allowed_branches required for %s", t.Type)
+			u, err := url.Parse(repo.URL)
+			if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+				return fmt.Errorf("invalid repository URL or embedded credentials")
+			}
+			if u.Scheme == "file" {
+				if !repo.AllowLocal || u.Host != "" || !filepath.IsAbs(u.Path) {
+					return fmt.Errorf("local repositories require allow_local and empty host")
+				}
+			} else if u.Scheme != "https" || u.Host == "" || repo.GitLabToken == "" {
+				return fmt.Errorf("repository requires https URL and gitlab_token")
+			}
+			if len(repo.AllowedBranches) == 0 {
+				return fmt.Errorf("allowed_branches required for %s", t.Type)
+			}
 		}
 		if len(t.HealthChecks) == 0 {
 			return fmt.Errorf("health_checks required for target %s", t.ServerName)
@@ -226,7 +247,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		if t.Type == release.ReleaseTypeFrontendStatic {
-			if c.AssetRetention <= 0 {
+			if t.SharedAssets && c.AssetRetention <= 0 {
 				return fmt.Errorf("frontend requires positive asset_retention")
 			}
 			u, err := url.Parse(t.PublicBaseURL)
@@ -278,4 +299,21 @@ func (c Config) Target(typ release.ReleaseType, site, root, project string) (Tar
 		}
 	}
 	return Target{}, fmt.Errorf("target or deployment path not authorized")
+}
+
+// Repository allowlist comes from node configuration, never an HTTP supplied URL.
+func ValidateArtifactRepository(value string) error {
+	if strings.ContainsAny(value, "@?#\\ \t\r\n") || strings.Contains(value, "://") || value != strings.ToLower(value) {
+		return fmt.Errorf("invalid artifact_repository")
+	}
+	u, err := url.Parse("https://" + value)
+	if err != nil || u.User != nil || u.Hostname() == "" || u.Path == "" || strings.Contains(u.Path, ":") || strings.HasSuffix(u.Path, "/") {
+		return fmt.Errorf("artifact_repository must be registry/project/app-dist without tag or digest")
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(u.Path, "/"), "/") {
+		if err := release.ValidateRepoSiteDirectoryName(part); err != nil {
+			return fmt.Errorf("invalid artifact_repository path: %w", err)
+		}
+	}
+	return nil
 }

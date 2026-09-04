@@ -39,7 +39,7 @@ flowchart LR
 ## 三、身份与授权
 
 - 环境以服务配置为准，请求不得跨环境。
-- 目标由配置中的 `type + server_name + path_dest` 明确列举。
+- 默认 targets 只列允许的 type。server_name/path_dest 从 POST params 传入，首次使用登记到持久状态；保留可选逐站点高级配置。
 - path_dest 规范化为真实绝对根目录。配置/白名单目录为 `<root>/<type>/<site>`；前端为 `<root>/<server_name>`，内部 `<完整SHA>` 与 `latest` 同级。
 - `target_id = SHA256(JSON([env, deployment_dir]))`；同目录同环境得到相同身份，project 不参与身份。
 - project 是可选约束/元数据。配置指定 project 时，省略会补为配置值，显式不一致拒绝。
@@ -51,11 +51,11 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 ## 四、配置契约
 
-完整示例位于 `configs/service.example.yaml`。未知 YAML 字段、旧字符串 targets、缺失的必填项启动即报错。
+默认示例位于 `configs/service.example.yaml`，前端示例位于 `configs/frontend-service.example.yaml`。字符串 targets 为默认写法；未知字段和多份 YAML 文档仍拒绝。完整配置/请求边界见 [HTTP 参数设计](docs/request-targets.md)。
 
-必填：listen_addr、node_id、env、data_dir、lock_file、本环境 Token、targets。Git 类型要求 repos 与非空 allowed_branches；前端要求 oras.binary/registry_config 绝对路径和每个目标的 artifact_repository 白名单。
+服务配置保留 data_dir、release_auth_tokens、日志、仓库连接信息和允许类型。listen_addr 默认 :9166，节点标识默认系统 hostname，默认锁为 data_dir/publish.lock；env 可按 Token 推导。Git 的 allowed_branches 可选；前端使用 oras.binary、oras.registry_config 和 oras.repository（可包含 {server_name}）。
 
-三种类型均要求 Nginx binary/config_file/prefix/pid_file 正确对应同一个实例。binary、config_file、pid_file 必须为绝对路径。
+已有单 Nginx 实例自动识别 master 二进制和启动参数，不要求 nginx 配置块。多实例可通过可选 pid_file 选择；完整路径配置仍兼容。服务不安装或启动另一份 Nginx。业务 HTTP 检查为可选高级配置，默认确认本地快照、nginx -t、reload、新 worker。
 
 每个目标至少有一条带内容断言的 health_checks，可设置 URL、Host、TLS server name、HTTP 状态及 contains。`{commit}` 可用于 URL/contains，运行时替换。首次无 latest 时使用单独的 initial_health_checks；无可验证基线不能假定恢复成功。
 
@@ -92,18 +92,18 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 ### 5.2 发布请求
 
-`POST /api/v1/releases/apply` 必须包含：
+`POST /api/v1/releases/apply` 字段：
 
 | 字段 | 约束 |
 | --- | --- |
-| release_id | 本次逻辑操作 UUID，重试不得更换 |
-| expected_state_revision | 查询得到的目标修订号 UUID |
+| release_id | 可选 UUID；省略由服务生成。需要重试时调用方预先生成并保存 |
+| expected_state_revision | 可选；填写时严格比对查询修订号。restore_of 恢复必填 |
 | env / type | 本节点环境及允许的三种类型 |
-| branch | Git 类型必填允许分支；前端可省略，不访问 Git |
-| artifact_digest | 前端必填 sha256 OCI manifest digest；Git 类型禁止传入 |
-| commit_id | 完整 40/64 位十六进制提交 ID |
+| branch | 可选。Git 不传时检查仓库允许分支的提交可达性；前端不使用 |
+| artifact_digest | 前端可选；省略时由完整 SHA tag 解析并固定摘要；Git 类型禁止传入 |
+| commit_id | 必填完整 40/64 位十六进制提交 ID；兼容 commitid |
 | params.server_name | 安全的单段站点名，禁止路径穿越与保留名称 |
-| params.path_dest | 与授权目标匹配的绝对根路径 |
+| params.path_dest | 必填绝对根路径，和站点名共同确定本次目标 |
 
 可选 source_repo（须等于 type）、project、version、operator、build_url、app。version 仅用于展示，不进入目录名。批次恢复额外填写 restore_of，见第九节。
 
@@ -111,15 +111,15 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 ### 5.3 幂等和并发结果
 
-同一 node 范围内 release_id 唯一，绑定规范化请求、target_id 和配置来源的摘要；前端来源为 artifact_repository@artifact_digest。相同 ID 不同参数返回 `409 RELEASE_ID_CONFLICT`。同参数运行中返回 409，终态重放原记录并标记 replayed，待恢复返回 503。
+同一 node 范围内 release_id 唯一，绑定规范化请求、target_id 和配置来源的摘要；前端显式摘要请求来源为 repository@artifact_digest；省略摘要时重试指纹绑定原始请求和配置仓库，解析后的摘要另存结果/候选状态。相同 ID 不同参数返回 `409 RELEASE_ID_CONFLICT`。同参数运行中返回 409，终态重放原记录并标记 replayed，待恢复返回 503。
 
 一个节点所有目标共享进程内互斥及 flock。锁覆盖接受记录、Git 缓存、快照准备、切换、Nginx 操作、状态提交与清理。其他进程启动恢复也必须持锁，禁止在另一发布进行中推断它已崩溃。
 
-预期 revision 在锁内再次检查。A→B→A 每次切换都会生成新 revision，旧 revision 不会因 commit 相同重新有效。
+提供预期 revision 时在锁内再次检查；省略时基于锁内当前状态执行。A→B→A 每次切换都会生成新 revision，旧 revision 不会因 commit 相同重新有效。
 
 ### 5.4 状态查询
 
-首次查询：`GET /api/v1/releases/state?env=...&type=...&server_name=...&path_dest=...`，path_dest 进行 URL 编码。后续使用 env+target_id；两种定位方式不能混用。project 可选。
+首次查询会按类型和请求参数登记目标，持久化到 data_dir/state。查询：`GET /api/v1/releases/state?env=...&type=...&server_name=...&path_dest=...`，path_dest 进行 URL 编码。后续使用 env+target_id；两种定位方式不能混用。project 可选。
 
 附加 release_id 可查原操作。响应中的 current、previous、state_revision、observed_link 是当前目标状态；release 是历史操作结果，不能把历史 succeeded 当成当前仍在运行该版本。只进行软链观测的 GET 不等价于再次完成 Nginx 生效检查。
 
@@ -213,7 +213,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 - latest 为原基线或候选不能确认：按本地基线恢复、验证，提交失败结果与新 revision。
 - latest 不属于已记录候选/基线：保留现场，要求人工处理。
 - 既有成功状态：比对当前链接、快照和 HTTP；不一致时阻止新发布。
-- 已移除配置目标还有未完成状态：阻止其他目标继续发布。
+- 已关闭发布类型（或删除高级站点配置）还有未完成状态：阻止其他目标继续发布。
 
 状态持久化失败不能报普通成功。可报告 recovery_required，即使在线文件看起来已经生效；下次启动从最后耐久记录恢复。操作者修正外部漂移后重新启动，由同样的校验收敛。
 
@@ -221,11 +221,11 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 单次发布自动恢复只使用本节点请求前保存的已验证快照，不 fetch Git，不依赖网络分支状态。重新切回原链接，测试/reload（如适用），验证旧行为。恢复成功仍表示本次发布失败，结果为 failed + restored + rollback succeeded，并生成新 revision。
 
-首次发布原来没有 latest，恢复可删除新链接，但必须通过 initial_health_checks 确认原入口。无法确认时 recovery_required，禁止后续发布。
+首次发布原来没有 latest，恢复删除新链接并检查 Nginx worker；高级配置提供 initial_health_checks 时也检查原入口。恢复失败则 recovery_required，禁止后续发布。
 
 正常人工发布旧提交可发新的 apply。撤销指定批次操作则发新 release_id，restore_of 引用同目标、同环境的一次 succeeded：
 
-- 请求 commit 必须等于原记录的本地基线提交；前端 artifact_digest 也必须等于原基线记录的摘要。
+- 请求 commit 必须等于原记录的本地基线提交；前端 artifact_digest 可省略而从原基线读取；显式提供时必须等于原基线摘要。
 - expected revision 必须同时等于当前 revision 与原成功操作的 after revision。
 - 当前版本必须仍是原操作候选。
 - 基线必须存在且完整；恢复直接使用本地快照。
@@ -292,7 +292,7 @@ commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签
 
 构建要求 Go 1.25+，运行建议 Linux；Git 类型需要 Git，前端需要 ORAS 1.3.x。节点启动不会主动安装 Nginx。
 
-新配置不兼容旧宽泛 targets 和任意目录前缀策略；不能给旧服务发送新 JSON 字段后假设协议有效。
+支持旧式 type 列表 targets、hostname 和可选 app；不恢复 Agent 通信。简化请求需要 request_targets_v1 能力，旧服务缺少此能力时不能假设兼容。
 
 已有文件无新状态时禁止直接发布。config/whitelist 提供 `-adopt-target/-adopt-branch/-adopt-commit` 离线导入：仅接受旧 latest 指向本目标完整提交子目录，逐文件与允许 Git 来源比对，建立快照、耐久意图后执行切换和验证。旧目录保留，中断后启动恢复。导入期间旧发布进程必须停止。
 

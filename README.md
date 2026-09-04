@@ -2,6 +2,8 @@
 
 Jenkins 或脚本通过 HTTP 同步调用每台节点。配置/白名单从允许的 Git 仓库提取，前端通过 ORAS 从 Harbor 拉取固定 digest 的 dist.tar.gz，生成不可变快照，切换 `latest`，验证 Nginx 生效后原子提交状态。失败时用本节点发布前快照恢复。
 
+默认配置只列 `targets: [config, whitelist]`；站点和绝对部署路径从每次 POST 的 `params` 传入，已有 Nginx 自动识别。完整约定见 [HTTP 参数与简化配置](docs/request-targets.md)。
+
 当前代码采用 HTTP 发布协议 2。旧 `internal/agent` 入口已移除，实现按接口、应用、领域、基础设施分层。不使用拉取任务、注册、心跳上报或 desired_state。设计说明见 [HTTP 设计文档](edge-sync-agent-design-v3.md)（沿用原文件名便于追踪）。
 
 ## 代码分层
@@ -43,14 +45,12 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
 ./bin/nginx_updata_config -config /etc/nginx-release/service.yaml
 ```
 
-`-check-config` 校验配置结构与目录映射，不检查仓库连通性、Nginx 安装或业务路由。参考 [service.example.yaml](configs/service.example.yaml)，至少配置：
+`-check-config` 只校验配置结构，不创建日志或状态目录，不连接仓库或探测 Nginx。参考 [默认配置](configs/service.example.yaml)：
 
-- 稳定的 `node_id`、环境、发布令牌及来源地址。
-- 本节点共享的 `data_dir` 和 `lock_file`。同一目标不能被不同状态目录或锁接管，`.publisher.json` 保存其归属。
-- 明确的 `type + server_name + path_dest` 目标、允许仓库和分支；`project` 可选，不参与目标身份。
-- Nginx 的绝对二进制、主配置、prefix、PID 文件路径。四者必须对应同一个实例。
-- 实际生效检查 `health_checks`。检查地址应直接命中本节点，可指定 Host 和 TLS server name；不能经过负载均衡随机访问其他节点。
-- 首次无 `latest` 时的 `initial_health_checks`，例如原入口返回 404。恢复首次失败时也用这些检查验证链接缺失的原状态。
+- `targets` 只列启用类型，`params.server_name`、`params.path_dest` 每次通过 HTTP 传入，`project` 是可选顶层字段。
+- `data_dir`、环境 Token、日志和各类型的仓库连接信息留在服务配置。默认锁为 `<data_dir>/publish.lock`，已部署节点应保留原锁路径。
+- 主机标识默认来自系统；支持可选 hostname/node_id。单 Nginx 实例自动识别运行中的 master，沿用启动参数和已有配置。
+- 不要求配置健康检查或业务 URL；默认校验快照、Nginx 语法及新 worker。业务 HTTP 探测和多实例路径覆盖见 [高级配置](configs/service.advanced.example.yaml)。
 
 服务配置中的令牌应限制文件读取权限。Nginx 必须具备读取快照文件和遍历部署目录的权限；默认目录 0755、文件 0644，配置可收紧。服务账号需有发布目录、状态目录及指定 Nginx 实例的操作权限。
 
@@ -81,7 +81,7 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
 
 Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。
 
-Git 类型的提交必须是允许分支可达的完整 40/64 位 ID。前端使用完整 Git SHA 加 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
+Git 类型使用完整 40/64 位提交 ID；branch 和 allowed_branches 可选，未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 
 ## HTTP 接口
 
@@ -95,6 +95,14 @@ Git 类型的提交必须是允许分支可达的完整 40/64 位 ID。前端使
 | `GET /metrics` | 有限维度的 Prometheus 指标 |
 
 apply/state 使用 `X-Release-Token`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
+
+简单发布请求如下，`commitid` 也可作为 `commit_id` 的兼容别名：
+
+```json
+{"env":"uat","type":"config","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","project":"ybf","params":{"server_name":"ybf-uat-nginx","path_dest":"/data/nginx-publish"}}
+```
+
+省略 release_id 时服务生成 UUID，响应返回该 ID；需要可重试操作时，应由调用方预先生成并保存 release_id。省略 expected_state_revision 时在节点锁内使用当前状态；需要防止过时请求覆盖后续发布时，使用下面的完整流程。简化请求要求 healthz capabilities 包含 `request_targets_v1`。
 
 先检查 `/healthz`：`release_contract` 必须等于 2，`publish_ready` 必须为 true。前端还要求 `capabilities` 包含 `frontend_oras_v1`。老服务缺少该字段时客户端停止。再查询目标并保存 `target_id`、`state_revision`：
 
@@ -142,7 +150,7 @@ GET /api/v1/releases/state?env=uat&target_id=<目标 ID>&release_id=<原请求 U
 优先使用脚本，它会在发布前检查全部节点、保存逐节点基线和 UUID，并将每次结果原子写入批次文件：
 
 ```bash
-export RELEASE_URLS='http://10.0.0.11:8081,http://10.0.0.12:8081'
+export RELEASE_URLS='http://10.0.0.11:9166,http://10.0.0.12:9166'
 export RELEASE_ENV=uat RELEASE_TYPE=config RELEASE_BRANCH=uat
 export RELEASE_PROJECT=ybf RELEASE_SERVER_NAME=ybf-uat-nginx
 export RELEASE_PATH_DEST=/data/nginx-publish
@@ -173,7 +181,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 例如 `/var/www/app/<完整SHA>`，Nginx root 为 `/var/www/app/latest`。latest 与 SHA 目录同级，不使用 releases/current。
 
 - CI 先 npm build，再用 `bash scripts/frontend-artifact.sh push dist ../artifact-bundle` 打包并经 HTTPS_PROXY 推送 SHA tag。脚本生成 `artifact.digest`，不更新 prod。
-- 前端 HTTP 请求必须含 `artifact_digest: sha256:<64位摘要>`；仓库只从目标的 `artifact_repository` 配置读取。branch 可省略，前端不访问 Git。
+- 前端 Harbor 地址从 `oras.repository` 读取，可包含 `{server_name}`；支持完整固定仓库名。未传 artifact_digest 时从完整 SHA tag 解析 manifest 后按摘要 pull；传入摘要时直接使用。前端不访问 Git。
 - 服务按 `repository@digest` 拉取，验证 OCI revision、tar 文件摘要和安全解包后，原子 rename 替换 latest。执行指定 Nginx 的 -t、reload、worker 和 HTTP 验证；失败仅用本地基线恢复。
 - 所有节点确认成功后，CI 用 `oras tag "$HARBOR_REPOSITORY@$RELEASE_ARTIFACT_DIGEST" prod` 更新展示标签。
 
@@ -222,7 +230,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 ## 旧版本迁移
 
-旧配置不能直接用于新服务；严格解析会拒绝字符串 targets、hostname、app 等旧字段。旧状态按 project/site 定位，不能直接当作新目标状态。
+支持字符串 targets、hostname 和可选 app。旧 Agent 状态按 project/site 定位，仍不能直接当作 HTTP v2 状态；已有 HTTP v2 状态可在保持 node_id/data_dir/lock_file 不变时从具体站点配置切换为类型列表。
 
 1. 停止旧发布进程，保存旧配置、状态和所有生效快照。
 2. 根据新示例配置显式目标、节点身份、共享锁和生效检查，先运行 `-check-config`。

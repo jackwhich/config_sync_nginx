@@ -53,7 +53,7 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 默认示例位于 `configs/service.example.yaml`，前端示例位于 `configs/frontend-service.example.yaml`。字符串 targets 为默认写法；未知字段和多份 YAML 文档仍拒绝。完整配置/请求边界见 [HTTP 参数设计](docs/request-targets.md)。
 
-服务配置保留 data_dir、release_auth_tokens、日志、仓库连接信息和允许类型。listen_addr 默认 :9166，节点标识默认系统 hostname，默认锁为 data_dir/publish.lock；env 可按 Token 推导。Git 的 allowed_branches 可选；前端使用 oras.binary、oras.registry_config 和 oras.repository（可包含 {server_name}）。
+服务配置保留 data_dir、release_auth_tokens、日志、仓库连接信息和允许类型。listen_addr 默认 :9166，节点标识默认系统 hostname，默认锁为 data_dir/publish.lock；env 可按 Token 推导。Git 的发布分支由 POST 顶层 branch 传入；高级配置 allowed_branches 只作可选的额外限制，默认示例不设置；前端使用 oras.binary、oras.registry_config 和 oras.repository（可包含 {server_name}）。
 
 服务不配置或识别 Nginx 实例，调用 PATH 中已有的 nginx -t，通过后执行 nginx -s reload。删除 nginx 路径块、PID/进程扫描、启动参数解析、worker 检查及直接 HUP。默认确认文件完整性、配置检查与 reload 命令结果；HTTP 探测保留为可选项。
 

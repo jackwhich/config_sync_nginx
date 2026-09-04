@@ -10,11 +10,11 @@ log_file: /data/wwwlogs/nginx-updata-config-http.log
 release_auth_tokens:
   uat: replace-with-uat-release-token
 
+# Git 仓库地址和凭据放在这里；本次发布分支由 POST 顶层 branch 传入。
 repos:
   config:
     url: https://gitlab.example.com/ops/nginx-vhosts.git
     gitlab_token: replace-with-config-read-token
-    # allowed_branches: [uat]  # 可选；不配置则允许仓库任意分支上的提交。
   whitelist:
     url: https://gitlab.example.com/ops/nginx-whitelist.git
     gitlab_token: replace-with-whitelist-read-token

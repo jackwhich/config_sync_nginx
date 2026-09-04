@@ -34,10 +34,12 @@ repos:
   config:
     url: https://gitlab.example.com/ops/nginx-vhosts.git
     gitlab_token: replace-with-read-repository-token
+    # 可选的分支允许列表，不指定本次发布分支；实际分支由 POST 顶层 branch 传入。
     allowed_branches: [uat]
   whitelist:
     url: https://gitlab.example.com/ops/nginx-whitelist.git
     gitlab_token: replace-with-read-repository-token
+    # 可选的分支允许列表，不指定本次发布分支；实际分支由 POST 顶层 branch 传入。
     allowed_branches: [uat]
 targets:
   - type: config

@@ -7,7 +7,7 @@
 | 放在哪里 | 内容 |
 | --- | --- |
 | 服务配置 | listen_addr、data_dir、log_file、release_auth_tokens、repos、oras、targets |
-| POST 顶层 | env、type、commit_id，可选 project |
+| POST 顶层 | env、type、commit_id，可选 branch、project |
 | POST params | server_name、path_dest（每次发布必填，绝对路径） |
 | 服务自动处理 | 节点主机名、默认发布锁、目标身份和持久状态、调用已有 nginx -t/reload 命令 |
 
@@ -30,7 +30,7 @@ path_dest 须为绝对路径，server_name 须为安全的单段目录名。同�
 - `env` 可选。只配置一个环境 Token 时自动采用该环境；多个环境 Token 时按请求 env 选择，显式配置 env 可限制本节点只处理一个环境。
 - `data_dir` 是固定服务状态目录。请求可额外携带同名顶层字段，但必须与配置路径一致，不能每次换一套状态/锁。
 - 默认 `lock_file` 为 `<data_dir>/publish.lock`。已部署且自定义过锁路径的节点需保留原值。
-- Git 类型从对应 `repos.config` 或 `repos.whitelist` 读取 URL 和凭据；未配置 `allowed_branches` 时允许仓库任意分支上的提交。
+- Git 类型从对应 `repos.config` 或 `repos.whitelist` 读取 URL 和凭据；本次分支由 POST 顶层 `branch` 传入，默认配置不指定分支。
 - `log_file` 输出 JSON Lines；留空输出到标准输出。
 - 超时、资源限制、历史版本数和来源 IP 限制保留为可选项。动态目标默认最多登记 1000 个，可用 `max_dynamic_targets` 调整。
 - 明确填写 `targets` 可以只启用指定类型；省略它时根据已配置的 Git/ORAS 仓库推导类型。
@@ -47,6 +47,7 @@ X-Release-Token: <uat 对应的 Token>
 {
   "env": "uat",
   "type": "config",
+  "branch": "uat",
   "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "project": "ybf",
   "params": {
@@ -58,7 +59,9 @@ X-Release-Token: <uat 对应的 Token>
 
 commit_id 必须为完整 40/64 位提交 ID，兼容 `commitid`。站点和目录推荐使用 params；兼容顶层 server_name/path_dest 以及 servee_name 拼写别名，重复提供不同值会报错。
 
-Git 未传 branch 时从仓库分支获取提交，验证提交确实位于允许分支，再导出该提交下的 server_name 目录；传入 branch 时只验证该分支。不会把 env 猜成 Git 分支名。
+Git 发布按请求中的 `branch` 拉取对应分支，确认 `commit_id` 位于该分支的提交历史中，再导出指定提交下的 server_name 目录。`env` 用于环境认证，`branch` 用于选择 Git 分支，两者独立，不会把 env 当成分支名。
+
+`allowed_branches` 是高级配置中可选的分支允许列表，只负责限制请求能使用哪些分支，不代替请求中的 `branch`。默认示例不配置此项；若显式配置，传入的 branch 还必须在列表内。为兼容仅传 commit_id 的调用，branch 仍可省略：此时检查提交在仓库某个允许分支上可达。
 
 ## 前端 Harbor pull
 

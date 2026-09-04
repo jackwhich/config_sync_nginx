@@ -1,0 +1,778 @@
+package publisher
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"nginx_updata_config/internal/infrastructure/nginx"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"nginx_updata_config/internal/config"
+	"nginx_updata_config/internal/domain/release"
+	"nginx_updata_config/internal/domain/state"
+	"nginx_updata_config/internal/infrastructure/applog"
+	"nginx_updata_config/internal/infrastructure/fsutil"
+	"nginx_updata_config/internal/infrastructure/git"
+	"nginx_updata_config/internal/infrastructure/lock"
+	"nginx_updata_config/internal/infrastructure/prom"
+	statestore "nginx_updata_config/internal/infrastructure/state"
+)
+
+// Runner executes one synchronous transaction at a time across every target on a node.
+// JSON snapshots published in views are immutable; only the lock owner mutates transactions.
+type Runner struct {
+	cfg      config.Config
+	git      git.Client
+	runtime  Runtime
+	store    *statestore.Store
+	nodeLock *lock.Lock
+	busy     chan struct{}
+	mu       sync.RWMutex
+	views    map[string]*state.TargetState
+	blocked  string
+	stopping bool
+}
+
+func New(cfg config.Config) (*Runner, error) { return NewWithRuntime(cfg, &nginx.Runtime{Config: cfg}) }
+func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
+	store, e := statestore.Open(cfg.DataDir)
+	if e != nil {
+		return nil, e
+	}
+	nl, e := lock.Open(cfg.LockFile)
+	if e != nil {
+		store.Close()
+		return nil, e
+	}
+	r := &Runner{cfg: cfg, git: git.Client{DataDir: cfg.DataDir, Repos: cfg.Repos, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, runtime: rt, store: store, nodeLock: nl, busy: make(chan struct{}, 1), views: map[string]*state.TargetState{}}
+	for _, t := range cfg.Targets {
+		prom.InitTarget(cfg.Env, string(t.Type), t.ID)
+	}
+	if e = nl.Try(); e != nil {
+		r.Close()
+		return nil, fmt.Errorf("startup requires idle node lock: %w", e)
+	}
+	defer nl.Unlock()
+	if e = r.load(); e != nil {
+		r.Close()
+		return nil, e
+	}
+	for _, t := range cfg.Targets {
+		if e := r.claimTarget(t); e != nil {
+			r.Close()
+			return nil, e
+		}
+		st, e := store.Load(t.ID)
+		if statestore.IsMissing(e) {
+			st = state.New(t)
+			base, err := openTarget(t)
+			if err != nil {
+				r.Close()
+				return nil, err
+			}
+			entries, err := fs.ReadDir(base.FS(), ".")
+			base.Close()
+			if err != nil {
+				r.Close()
+				return nil, err
+			}
+			// Existing unmanaged files must be explicitly migrated, never silently adopted.
+			for _, entry := range entries {
+				if entry.Name() != ".publisher.json" {
+					st.RecoveryRequired = true
+				}
+			}
+			if e = r.save(st); e != nil {
+				r.Close()
+				return nil, e
+			}
+		} else if e != nil {
+			r.Close()
+			return nil, e
+		}
+		if st.Target.Dir != t.Dir {
+			r.Close()
+			return nil, fmt.Errorf("state target directory mismatch")
+		}
+		if st.ActiveID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.RecoveryTimeout.Value())
+			r.recoverStartup(ctx, t, st)
+			cancel()
+		} else if st.Current != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.StepTimeout.Value())
+			err := r.checkStoredBaseline(ctx, t, st)
+			cancel()
+			if err != nil {
+				st.RecoveryRequired = true
+			} else {
+				st.RecoveryRequired = false
+			}
+			if err := r.save(st); err != nil {
+				r.block(err.Error())
+			}
+		}
+	}
+	// Pending work for targets removed from configuration cannot be recovered safely.
+	r.mu.RLock()
+	for _, st := range r.views {
+		if (st.ActiveID != "" || st.RecoveryRequired) && !r.configured(st.Target.ID) {
+			e = fmt.Errorf("unconfigured target needs recovery: %s", st.Target.ID)
+		}
+	}
+	r.mu.RUnlock()
+	if e != nil {
+		r.block(e.Error())
+	}
+	r.Health()
+	return r, nil
+}
+func (r *Runner) Close() {
+	if r.nodeLock != nil {
+		r.nodeLock.Close()
+	}
+	if r.store != nil {
+		r.store.Close()
+	}
+}
+func (r *Runner) Stop() { r.mu.Lock(); r.stopping = true; r.mu.Unlock() }
+func (r *Runner) Wait(ctx context.Context) error {
+	select {
+	case r.busy <- struct{}{}:
+		<-r.busy
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (r *Runner) configured(id string) bool {
+	for _, t := range r.cfg.Targets {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+func (r *Runner) block(reason string) { r.mu.Lock(); r.blocked = reason; r.mu.Unlock() }
+func clone(st *state.TargetState) *state.TargetState {
+	b, _ := json.Marshal(st)
+	var out state.TargetState
+	_ = json.Unmarshal(b, &out)
+	return &out
+}
+func (r *Runner) publish(st *state.TargetState) {
+	cp := clone(st)
+	r.mu.Lock()
+	r.views[st.Target.ID] = cp
+	r.mu.Unlock()
+}
+func (r *Runner) save(st *state.TargetState) error {
+	if e := r.store.Save(st); e != nil {
+		prom.PersistFailure(r.cfg.Env, string(st.Target.Type), st.Target.ID)
+		applog.LogError("发布状态写入失败", "state_persist_failed", map[string]any{"env": r.cfg.Env, "target_id": st.Target.ID, "error": e.Error()})
+		return e
+	}
+	r.publish(st)
+	return nil
+}
+func (r *Runner) load() error {
+	states, e := r.store.All()
+	if e != nil {
+		return e
+	}
+	next := map[string]*state.TargetState{}
+	ids := map[string]bool{}
+	for _, st := range states {
+		for id := range st.Records {
+			if ids[id] {
+				return fmt.Errorf("duplicate release_id in persistent state")
+			}
+			ids[id] = true
+		}
+		next[st.Target.ID] = st
+	}
+	r.mu.Lock()
+	r.views = next
+	r.mu.Unlock()
+	return nil
+}
+func (r *Runner) Health() map[string]any {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ready := !r.stopping && r.blocked == ""
+	reason := r.blocked
+	for _, st := range r.views {
+		verifiedAt := time.Time{}
+		if st.Current != nil {
+			verifiedAt = st.Current.VerifiedAt
+		}
+		prom.TargetState(r.cfg.Env, string(st.Target.Type), st.Target.ID, st.RecoveryRequired, verifiedAt)
+		if st.RecoveryRequired {
+			ready = false
+			if reason == "" {
+				reason = "target requires recovery or explicit baseline migration"
+			}
+		}
+	}
+	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
+	return map[string]any{"status": "ok", "release_contract": 2, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
+}
+func (r *Runner) Target(id string) (config.Target, bool) {
+	for _, t := range r.cfg.Targets {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return config.Target{}, false
+}
+func (r *Runner) Resolve(typ release.ReleaseType, site, root, project string) (config.Target, error) {
+	return r.cfg.Target(typ, site, root, project)
+}
+
+// State includes the live revision independently of a historical release result.
+func (r *Runner) State(id, releaseID string) (map[string]any, int, error) {
+	t, ok := r.Target(id)
+	if !ok {
+		return nil, 403, fmt.Errorf("target not authorized")
+	}
+	st, e := r.store.Load(id)
+	if e != nil {
+		return nil, 503, e
+	}
+	r.mu.RLock()
+	if r.blocked != "" {
+		if local := r.views[id]; local != nil {
+			st = local
+		}
+	}
+	r.mu.RUnlock()
+	out := map[string]any{"release_contract": 2, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
+	if st.Current != nil {
+		out["current_commit_id"] = st.Current.CommitID
+	}
+	if st.Previous != nil {
+		out["previous_commit_id"] = st.Previous.CommitID
+	}
+	base, e := openTarget(t)
+	if e != nil {
+		return nil, 503, e
+	}
+	link, e := fsutil.Link(base)
+	base.Close()
+	if e != nil {
+		out["observed_link_error"] = e.Error()
+	} else {
+		out["observed_link"] = link
+	}
+	if releaseID != "" {
+		rec := st.Records[releaseID]
+		if rec == nil {
+			return nil, 404, fmt.Errorf("release_id not found")
+		}
+		out["release"] = rec.Result
+		out["release_http_status"] = rec.HTTPStatus
+		out["baseline"] = rec.Baseline
+		out["before_link"] = rec.BeforeLink
+	}
+	return out, 200, nil
+}
+func reject(req release.ApplyRequest, code int, key, msg string) release.Result {
+	return release.Result{ReleaseID: req.ReleaseID, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: msg, HTTPStatus: code, StartedAt: time.Now().UTC()}
+}
+func (r *Runner) duplicate(req release.ApplyRequest, fingerprint string) (release.Result, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, st := range r.views {
+		if rec := st.Records[req.ReleaseID]; rec != nil {
+			if rec.Fingerprint != fingerprint {
+				return reject(req, 409, "RELEASE_ID_CONFLICT", "release_id was already used with different parameters"), true
+			}
+			result := rec.Result
+			result.HTTPStatus = rec.HTTPStatus
+			if result.Terminal() {
+				result.Replayed = true
+			} else if result.Status == release.NodeStatusRecoveryRequired {
+				result.HTTPStatus = 503
+			} else {
+				result.HTTPStatus = 409
+				result.ErrorCode = "RELEASE_RUNNING"
+			}
+			return result, true
+		}
+	}
+	return release.Result{}, false
+}
+func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Result {
+	if e := release.ValidateApplyRequest(&req); e != nil {
+		return reject(req, 400, "INVALID_REQUEST", e.Error())
+	}
+	if req.Env != r.cfg.Env {
+		return reject(req, 403, "ENV_NOT_ALLOWED", "environment does not match this node")
+	}
+	t, e := r.Resolve(req.Type, release.ServerIdentity(req.Params), req.Params["path_dest"], req.Project)
+	if e != nil {
+		return reject(req, 403, "TARGET_NOT_ALLOWED", e.Error())
+	}
+	req.Params["path_dest"] = t.PathDest
+	if req.Project == "" {
+		req.Project = t.Project
+	}
+	req.Version = release.EffectiveVersion(req)
+	fingerprint := release.Digest(struct {
+		Request      release.ApplyRequest
+		Target, Repo string
+	}{req, t.ID, r.cfg.Repos[req.SourceRepo].URL})
+	if result, ok := r.duplicate(req, fingerprint); ok {
+		return result
+	}
+	select {
+	case r.busy <- struct{}{}:
+		defer func() { <-r.busy }()
+	default:
+		return reject(req, 409, "NODE_BUSY", "another release owns the node lock")
+	}
+	if e = r.nodeLock.Try(); e != nil {
+		if errors.Is(e, lock.ErrBusy) {
+			return reject(req, 409, "NODE_BUSY", e.Error())
+		}
+		return reject(req, 503, "LOCK_FAILED", e.Error())
+	}
+	defer r.nodeLock.Unlock()
+	if e = r.load(); e != nil {
+		r.block(e.Error())
+		return reject(req, 503, "STATE_UNAVAILABLE", e.Error())
+	}
+	if result, ok := r.duplicate(req, fingerprint); ok {
+		return result
+	}
+	r.mu.RLock()
+	blocked := r.blocked
+	stopping := r.stopping
+	for _, s := range r.views {
+		if s.RecoveryRequired || s.ActiveID != "" {
+			blocked = "node has unfinished work; restart for recovery"
+		}
+	}
+	r.mu.RUnlock()
+	if blocked != "" || stopping {
+		return reject(req, 503, "RECOVERY_REQUIRED", "publication unavailable: "+blocked)
+	}
+	st, e := r.store.Load(t.ID)
+	if e != nil {
+		return reject(req, 503, "STATE_UNAVAILABLE", e.Error())
+	}
+	if req.ExpectedStateRevision != st.Revision {
+		return reject(req, 409, "STATE_REVISION_CONFLICT", "target revision has changed; query live state")
+	}
+	if req.RestoreOf != "" {
+		original := st.Records[req.RestoreOf]
+		if original == nil || original.Result.Status != release.NodeStatusSucceeded || original.Result.StateRevisionAfter != st.Revision || original.Baseline == nil || st.Current == nil || original.Candidate == nil || st.Current.CommitID != original.Candidate.CommitID || req.CommitID != original.Baseline.CommitID {
+			return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "restore requires the successful release's retained baseline and unchanged resulting revision")
+		}
+	}
+	prom.Active(r.cfg.Env, string(t.Type), t.ID, true)
+	defer prom.Active(r.cfg.Env, string(t.Type), t.ID, false)
+	rec := &state.Record{Request: req, Fingerprint: fingerprint, Baseline: st.Current, BaselinePrevious: st.Previous, HTTPStatus: 409}
+	rec.Result = release.Result{ReleaseID: req.ReleaseID, TargetID: t.ID, Env: req.Env, Type: req.Type, Project: req.Project, ServerName: t.ServerName, Version: req.Version, CommitID: req.CommitID, Status: release.NodeStatusRunning, Phase: "accepted", ActivationStatus: "unchanged", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}
+	if st.Current != nil {
+		rec.Result.PreviousCommitID = st.Current.CommitID
+	}
+	st.Records[req.ReleaseID] = rec
+	st.ActiveID = req.ReleaseID
+	if e = r.save(st); e != nil {
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+	}
+	deadline := rec.Result.StartedAt.Add(r.cfg.ExecutionTimeout.Value())
+	prep, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	base, e := openTarget(t)
+	if e != nil {
+		return r.fail(st, rec, "TARGET_UNAVAILABLE", e)
+	}
+	defer base.Close()
+	// Validate the real baseline even for a same-commit skip.
+	e = r.step(prep, st, rec, "verify_baseline", func(c context.Context) error {
+		link, e := fsutil.Link(base)
+		if e != nil {
+			return e
+		}
+		expected := ""
+		if st.Current != nil {
+			expected = st.Current.Link
+		}
+		if link != expected {
+			return fmt.Errorf("live latest differs from authoritative baseline")
+		}
+		rec.BeforeLink = link
+		return r.verify(c, t, base, st.Current)
+	})
+	if e != nil {
+		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+			return r.fail(st, rec, "BASELINE_CHECK_CANCELLED", e)
+		}
+		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
+	}
+	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == r.cfg.Repos[req.SourceRepo].URL {
+		rec.Result.Status = release.NodeStatusSkipped
+		rec.Result.Phase = "complete"
+		rec.Result.FinishedAt = time.Now().UTC()
+		rec.HTTPStatus = 200
+		st.ActiveID = ""
+		if e = r.save(st); e != nil {
+			return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+		}
+		return r.result(rec)
+	}
+	if req.RestoreOf != "" {
+		original := st.Records[req.RestoreOf]
+		candidate := *original.Baseline
+		candidate.Version = req.Version
+		rec.Candidate = &candidate
+		e = r.step(prep, st, rec, "prepare_snapshot", func(c context.Context) error { _, e := verifySnapshot(c, base, rec.Candidate); return e })
+	} else {
+		var work, actual string
+		e = r.step(prep, st, rec, "fetch", func(c context.Context) error {
+			var err error
+			work, actual, err = r.git.Checkout(c, req.SourceRepo, req.Branch, req.CommitID, t.ServerName)
+			return err
+		})
+		if work != "" {
+			defer r.cleanupExport(t, work)
+		}
+		if e == nil {
+			e = r.step(prep, st, rec, "prepare_snapshot", func(c context.Context) error {
+				var err error
+				rec.Candidate, err = prepareSnapshot(c, r.cfg, t, work, actual, r.cfg.Repos[req.SourceRepo].URL, req.Version)
+				return err
+			})
+		}
+	}
+	if e != nil {
+		return r.fail(st, rec, "PREPARE_FAILED", e)
+	}
+	e = r.step(prep, st, rec, "verify_candidate", func(c context.Context) error {
+		m, e := verifySnapshot(c, base, rec.Candidate)
+		if e != nil {
+			return e
+		}
+		return installAssets(c, base, rec.Candidate, m)
+	})
+	if e != nil {
+		return r.fail(st, rec, "CANDIDATE_INVALID", e)
+	}
+	if e = prep.Err(); e != nil {
+		return r.fail(st, rec, "PREPARE_CANCELLED", e)
+	}
+	// Critical work has its own deadline: disconnects can no longer interrupt activation/recovery.
+	critical, criticalCancel := context.WithDeadline(context.Background(), deadline)
+	defer criticalCancel()
+	if currentLink, err := fsutil.Link(base); err != nil || currentLink != rec.BeforeLink {
+		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", fmt.Errorf("latest changed during preparation"))
+	}
+	rec.Intent = true
+	rec.Result.Phase = "switch_intent"
+	if e = r.save(st); e != nil {
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+	}
+	e = r.step(critical, st, rec, "switch", func(c context.Context) error {
+		if e := c.Err(); e != nil {
+			return e
+		}
+		return fsutil.Switch(base, rec.Candidate.Link)
+	})
+	if e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+		e = r.step(critical, st, rec, "nginx_test", r.runtime.Test)
+	}
+	if e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+		e = r.step(critical, st, rec, "reload", r.runtime.Reload)
+	}
+	if e == nil {
+		e = r.step(critical, st, rec, "verify_activation", func(c context.Context) error {
+			if e := r.verify(c, t, base, rec.Candidate); e != nil {
+				return e
+			}
+			return r.verifyRetainedAssets(c, t, base, st, rec)
+		})
+	}
+	if e != nil {
+		return r.restore(t, st, rec, "ACTIVATION_FAILED", e)
+	}
+	return r.commit(t, st, rec)
+}
+func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Record, name string, fn func(context.Context) error) error {
+	rec.Result.Phase = name
+	if e := r.save(st); e != nil {
+		return e
+	}
+	started := time.Now()
+	stepCtx, cancel := context.WithTimeout(ctx, r.cfg.StepTimeout.Value())
+	defer cancel()
+	err := stepCtx.Err()
+	if err == nil {
+		err = fn(stepCtx)
+	}
+	status := release.NodeStatusSucceeded
+	message := ""
+	if err != nil {
+		status = release.NodeStatusFailed
+		message = err.Error()
+	}
+	rec.Result.Steps = append(rec.Result.Steps, release.Step{Name: name, Status: status, Message: message, StartedAt: started.UTC(), DurationMS: time.Since(started).Milliseconds()})
+	prom.Step(r.cfg.Env, string(st.Target.Type), st.Target.ID, name, string(status), time.Since(started))
+	fields := map[string]any{"env": r.cfg.Env, "node_id": r.cfg.NodeID, "release_id": rec.Request.ReleaseID, "target_id": st.Target.ID, "step": name, "status": status, "duration_ms": time.Since(started).Milliseconds()}
+	if err != nil {
+		fields["error"] = message
+		applog.LogError("发布步骤失败", "release_step", fields)
+	} else {
+		applog.LogInfo("发布步骤完成", "release_step", fields)
+	}
+	return err
+}
+func (r *Runner) verify(ctx context.Context, t config.Target, base *os.Root, v *state.Version) error {
+	commit := ""
+	var m *state.Manifest
+	var e error
+	if v != nil {
+		m, e = verifySnapshot(ctx, base, v)
+		if e != nil {
+			return e
+		}
+		commit = v.CommitID
+	}
+	if e = r.runtime.Verify(ctx, t, commit, v == nil); e != nil {
+		return e
+	}
+	if t.Type == release.ReleaseTypeFrontendStatic && v != nil {
+		return nginx.VerifyFrontendHTTP(ctx, t, m)
+	}
+	return nil
+}
+func (r *Runner) result(rec *state.Record) release.Result {
+	result := rec.Result
+	result.HTTPStatus = rec.HTTPStatus
+	if result.Terminal() {
+		prom.Terminal(r.cfg.Env, string(result.Type), result.TargetID, string(result.Status))
+	}
+	fields := map[string]any{"env": r.cfg.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
+	if result.Status == release.NodeStatusFailed || result.Status == release.NodeStatusRecoveryRequired {
+		fields["error"] = result.Error
+		applog.LogError("发布执行失败", "release_result", fields)
+	} else {
+		applog.LogInfo("发布执行完成", "release_result", fields)
+	}
+	return result
+}
+func (r *Runner) fail(st *state.TargetState, rec *state.Record, key string, cause error) release.Result {
+	rec.Result.Status = release.NodeStatusFailed
+	rec.Result.ErrorCode = key
+	rec.Result.Error = cause.Error()
+	rec.Result.FinishedAt = time.Now().UTC()
+	rec.HTTPStatus = http.StatusInternalServerError
+	st.ActiveID = ""
+	if e := r.save(st); e != nil {
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+	}
+	return r.result(rec)
+}
+func (r *Runner) uncertain(st *state.TargetState, rec *state.Record, key string, cause error) release.Result {
+	st.RecoveryRequired = true
+	st.ActiveID = rec.Request.ReleaseID
+	rec.Result.Status = release.NodeStatusRecoveryRequired
+	rec.Result.ErrorCode = key
+	rec.Result.Error = cause.Error()
+	rec.HTTPStatus = 503
+	if rec.Intent {
+		rec.Result.ActivationStatus = "unknown"
+	}
+	rec.Result.RollbackStatus = "unavailable"
+	if key == "RECOVERY_FAILED" {
+		rec.Result.RollbackStatus = "failed"
+	}
+	r.publish(st)
+	// Even when persisting this failure fails, the last durable intent remains recoverable.
+	if e := r.save(st); e != nil {
+		r.block("state persistence failed: " + e.Error())
+	}
+	return r.result(rec)
+}
+func (r *Runner) commit(t config.Target, st *state.TargetState, rec *state.Record) release.Result {
+	rec.Candidate.VerifiedAt = time.Now().UTC()
+	st.Previous = rec.Baseline
+	if rec.LegacyLink != "" {
+		st.Previous = nil
+	}
+	st.Current = rec.Candidate
+	st.Revision = release.ID()
+	st.ActiveID = ""
+	st.RecoveryRequired = false
+	rec.Result.Status = release.NodeStatusSucceeded
+	rec.Result.Phase = "complete"
+	rec.Result.ActivationStatus = "verified"
+	rec.Result.RollbackStatus = "not_needed"
+	rec.Result.ErrorCode = ""
+	rec.Result.Error = ""
+	rec.Result.StateRevisionAfter = st.Revision
+	rec.Result.FinishedAt = time.Now().UTC()
+	rec.HTTPStatus = 200
+	if e := r.save(st); e != nil {
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+	}
+	cleanup, cancel := context.WithTimeout(context.Background(), r.cfg.CleanupTimeout.Value())
+	e := cleanupSnapshots(cleanup, r.cfg, t, st)
+	cancel()
+	if e != nil {
+		prom.CleanupFailure(r.cfg.Env, string(t.Type), t.ID)
+		applog.LogWarn("历史快照清理失败", "cleanup_warning", map[string]any{"release_id": rec.Request.ReleaseID, "target_id": t.ID, "error": e.Error()})
+		rec.Result.Warnings = append(rec.Result.Warnings, "cleanup: "+e.Error())
+		if e = r.save(st); e != nil {
+			rec.Result.Warnings = append(rec.Result.Warnings, "cleanup warning not persisted: "+e.Error())
+		}
+	}
+	return r.result(rec)
+}
+func (r *Runner) restore(t config.Target, st *state.TargetState, rec *state.Record, key string, cause error) release.Result {
+	outcome := "failed"
+	defer func() { prom.Rollback(r.cfg.Env, string(t.Type), t.ID, outcome) }()
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.RecoveryTimeout.Value())
+	defer cancel()
+	base, e := openTarget(t)
+	if e != nil {
+		return r.uncertain(st, rec, "RECOVERY_FAILED", e)
+	}
+	defer base.Close()
+	e = r.restoreLocal(ctx, t, base, rec)
+	if e != nil {
+		return r.uncertain(st, rec, "RECOVERY_FAILED", fmt.Errorf("%v; recovery: %w", cause, e))
+	}
+	outcome = "succeeded"
+	st.Current = rec.Baseline
+	st.Previous = rec.BaselinePrevious
+	st.Revision = release.ID()
+	st.ActiveID = ""
+	st.RecoveryRequired = false
+	rec.Result.ActivationStatus = "restored"
+	rec.Result.RollbackStatus = "succeeded"
+	rec.Result.StateRevisionAfter = st.Revision
+	rec.Result.Phase = "restored"
+	return r.fail(st, rec, key, cause)
+}
+func (r *Runner) restoreLocal(ctx context.Context, t config.Target, base *os.Root, rec *state.Record) error {
+	if rec.Baseline != nil {
+		if _, e := verifySnapshot(ctx, base, rec.Baseline); e != nil {
+			return e
+		}
+	}
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	if e := fsutil.Switch(base, rec.BeforeLink); e != nil {
+		return e
+	}
+	if t.Type != release.ReleaseTypeFrontendStatic {
+		if e := r.runtime.Test(ctx); e != nil {
+			return e
+		}
+		if e := r.runtime.Reload(ctx); e != nil {
+			return e
+		}
+	}
+	return r.verify(ctx, t, base, rec.Baseline)
+}
+func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.TargetState) {
+	rec := st.Records[st.ActiveID]
+	if rec == nil {
+		r.block("active release record missing")
+		return
+	}
+	if !rec.Intent {
+		if rec.Result.ErrorCode == "BASELINE_UNVERIFIED" {
+			if err := r.checkStoredBaseline(ctx, t, st); err != nil {
+				return
+			}
+			st.Revision = release.ID()
+			rec.Result.StateRevisionAfter = st.Revision
+		}
+		st.RecoveryRequired = false
+		r.fail(st, rec, "INTERRUPTED", errorMarker{})
+		return
+	}
+	base, e := openTarget(t)
+	if e != nil {
+		r.uncertain(st, rec, "RECOVERY_FAILED", e)
+		return
+	}
+	defer base.Close()
+	link, e := fsutil.Link(base)
+	if e != nil {
+		r.uncertain(st, rec, "RECOVERY_FAILED", e)
+		return
+	}
+	if rec.Candidate != nil && link == rec.Candidate.Link {
+		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil && t.Type != release.ReleaseTypeFrontendStatic {
+			e = r.runtime.Test(ctx)
+			if e == nil {
+				e = r.runtime.Reload(ctx)
+			}
+		}
+		if e == nil {
+			e = r.verify(ctx, t, base, rec.Candidate)
+		}
+		if e == nil {
+			e = r.verifyRetainedAssets(ctx, t, base, st, rec)
+		}
+		if e == nil {
+			r.commit(t, st, rec)
+			return
+		}
+	} else if link != rec.BeforeLink && (rec.LegacyLink == "" || link != rec.LegacyLink) {
+		r.uncertain(st, rec, "EXTERNAL_DRIFT", fmt.Errorf("latest no longer matches candidate or baseline"))
+		return
+	}
+	r.restore(t, st, rec, "INTERRUPTED", fmt.Errorf("interrupted activation; restored local baseline"))
+}
+
+type errorMarker struct{}
+
+func (errorMarker) Error() string { return "service stopped before activation" }
+
+func (r *Runner) checkStoredBaseline(ctx context.Context, t config.Target, st *state.TargetState) error {
+	base, err := openTarget(t)
+	if err != nil {
+		return err
+	}
+	defer base.Close()
+	expected := ""
+	if st.Current != nil {
+		expected = st.Current.Link
+	}
+	link, err := fsutil.Link(base)
+	if err != nil {
+		return err
+	}
+	if link != expected {
+		return fmt.Errorf("latest differs from persistent baseline")
+	}
+	if err := r.verify(ctx, t, base, st.Current); err != nil {
+		return err
+	}
+	return r.verifyRetainedAssets(ctx, t, base, st, nil)
+}
+
+func (r *Runner) cleanupExport(t config.Target, work string) {
+	root, e := os.OpenRoot(filepath.Dir(work))
+	if e != nil {
+		return
+	}
+	defer root.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CleanupTimeout.Value())
+	defer cancel()
+	if e = fsutil.RemoveTree(ctx, root, filepath.Base(work)); e != nil {
+		prom.CleanupFailure(r.cfg.Env, string(t.Type), t.ID)
+		applog.LogWarn("导出临时目录清理未完成", "cleanup_warning", map[string]any{"target_id": t.ID, "error": e.Error()})
+	}
+}

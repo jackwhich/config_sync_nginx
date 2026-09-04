@@ -42,12 +42,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("加载配置: %w", err)
 	}
-	if err = applog.Init(cfg.LogFile); err != nil {
-		return err
-	}
 	if *check {
 		applog.LogInfo("配置有效", "config_valid", map[string]any{"node_id": cfg.NodeID, "targets": len(cfg.Targets)})
 		return nil
+	}
+	if err = applog.Init(cfg.LogFile); err != nil {
+		return err
 	}
 	if *adopt != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.ExecutionTimeout.Value()+cfg.RecoveryTimeout.Value())

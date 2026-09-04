@@ -14,6 +14,8 @@ type HealthCheck struct {
 	Contains      string `yaml:"contains" json:"contains,omitempty"`
 }
 type Target struct {
+	ArtifactRepository  string              `yaml:"artifact_repository" json:"artifact_repository,omitempty"`
+	SharedAssets        bool                `yaml:"shared_assets" json:"-"`
 	Type                release.ReleaseType `yaml:"type" json:"type"`
 	ServerName          string              `yaml:"server_name" json:"server_name"`
 	PathDest            string              `yaml:"path_dest" json:"path_dest"`
@@ -31,4 +33,12 @@ type Target struct {
 func (t Target) Mode() os.FileMode {
 	v, _ := strconv.ParseUint(t.FileMode, 8, 32)
 	return os.FileMode(v)
+}
+
+// SnapshotLink is relative to <path_dest>/<server_name> for frontend releases.
+func (t Target) SnapshotLink(commit string) string {
+	if t.Type == release.ReleaseTypeFrontendStatic {
+		return commit
+	}
+	return "releases/" + commit
 }

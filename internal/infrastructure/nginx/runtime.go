@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,9 +25,18 @@ type Runtime struct {
 }
 
 func (n *Runtime) args(extra ...string) []string {
-	a := []string{"-c", n.Config.Nginx.ConfigFile}
+	a := []string{}
+	if n.Config.Nginx.ConfigFile != "" {
+		a = append(a, "-c", n.Config.Nginx.ConfigFile)
+	}
 	if n.Config.Nginx.Prefix != "" {
 		a = append(a, "-p", n.Config.Nginx.Prefix)
+	}
+	if n.Config.Nginx.GlobalDirectives != "" {
+		a = append(a, "-g", n.Config.Nginx.GlobalDirectives)
+	}
+	if n.Config.Nginx.ErrorLog != "" {
+		a = append(a, "-e", n.Config.Nginx.ErrorLog)
 	}
 	return append(a, extra...)
 }
@@ -35,13 +45,16 @@ func (n *Runtime) Test(ctx context.Context) error {
 	return e
 }
 func (n *Runtime) workers(ctx context.Context) (map[int]bool, error) {
-	b, e := os.ReadFile(n.Config.Nginx.PIDFile)
-	if e != nil {
-		return nil, e
-	}
-	master, e := strconv.Atoi(strings.TrimSpace(string(b)))
-	if e != nil || master <= 1 {
-		return nil, fmt.Errorf("invalid nginx master pid")
+	master := n.Config.Nginx.MasterPID
+	if master == 0 {
+		b, e := os.ReadFile(n.Config.Nginx.PIDFile)
+		if e != nil {
+			return nil, e
+		}
+		master, e = strconv.Atoi(strings.TrimSpace(string(b)))
+		if e != nil || master <= 1 {
+			return nil, fmt.Errorf("invalid nginx master pid")
+		}
 	}
 	out, e := process.Run(ctx, "", nil, nil, "ps", "-eo", "pid=,ppid=,args=")
 	if e != nil {
@@ -75,6 +88,9 @@ func (n *Runtime) Reload(ctx context.Context) error {
 	}
 	n.beforeWorkers = p
 	n.reloaded = true
+	if n.Config.Nginx.MasterPID > 1 {
+		return syscall.Kill(n.Config.Nginx.MasterPID, syscall.SIGHUP)
+	}
 	_, e = process.Run(ctx, "", nil, nil, n.Config.Nginx.Binary, n.args("-s", "reload")...)
 	return e
 }
@@ -82,7 +98,7 @@ func (n *Runtime) Verify(ctx context.Context, t config.Target, commit string, in
 	checks := t.HealthChecks
 	if initial {
 		checks = t.InitialHealthChecks
-		if len(checks) == 0 {
+		if len(checks) == 0 && !t.Dynamic {
 			return fmt.Errorf("initial baseline health checks not configured")
 		}
 	}

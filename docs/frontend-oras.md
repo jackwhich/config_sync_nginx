@@ -82,34 +82,24 @@ printf '%s' "$HARBOR_PULL_PASSWORD" | /usr/local/bin/oras login harbor.example.c
 
 凭据文件由服务账号读取并限制为 0600。服务配置仓库白名单，HTTP 请求不能指定任意 Harbor 地址，也不接收 registry 密码。主机 ORAS 子进程显式清空大小写 HTTP/HTTPS/ALL_PROXY 并设置 NO_PROXY=*；不会继承 CI 代理或启用 ORAS 磁盘缓存。私有 CA 使用 `oras.ca_file`，不关闭 TLS 校验。
 
-完整服务配置见 `configs/frontend-service.example.yaml`。关键目标配置：
+完整服务配置见 `configs/frontend-service.example.yaml`。仓库地址集中配置，站点和部署路径由 HTTP 请求传入：
 
 ```yaml
 oras:
   binary: /usr/local/bin/oras
   registry_config: /etc/nginx-release/harbor-auth.json
+  repository: harbor.example.com/web/{server_name}-dist
 targets:
-  - type: frontend_static
-    server_name: app
-    path_dest: /var/www
-    artifact_repository: harbor.example.com/web/app-dist
-    shared_assets: false
-    required_files: [index.html]
-    public_base_url: http://127.0.0.1:8080
-    public_host: app.example.com
-    health_checks:
-      - {url: "http://127.0.0.1:8080/.release-version", host: "app.example.com", contains: "{commit}"}
-    initial_health_checks:
-      - {url: "http://127.0.0.1:8080/", host: "app.example.com", status: 404}
+  - frontend_static
 ```
 
-Nginx root 指向 `/var/www/app/latest`，示例见 `configs/frontend-location.example.conf`。binary/config_file/prefix/pid_file 必须明确对应这个实例。默认前端也执行 nginx -t、reload、新 worker 检查和实际 HTTP 文件摘要验证。
+`{server_name}` 替换为 params 中的站点名；也可写完整固定仓库名。Nginx 已有 root 指向 `/var/www/app/latest`，示例见 `configs/frontend-location.example.conf`。运行中的单实例自动识别，无需 nginx 路径块。默认执行 nginx -t、reload、新 worker 和本地文件摘要验证；实际业务 HTTP 验证可通过高级逐站点配置启用，见 [请求配置约定](request-targets.md)。
 
 ## HTTP 发布与恢复
 
 协议主版本保持 2；前端客户端额外要求 healthz 的 capabilities 包含 `frontend_oras_v1`。缺少此能力时，在任何 POST 之前停止，避免把新请求发给旧 Git 前端服务。
 
-前端请求增加必填 artifact_digest，branch 可省略（不查询 Git 分支）：
+前端请求只需完整 commit_id 和站点参数。artifact_digest 可选：不传时读取完整 SHA tag 的 manifest，验证后计算 digest 并按该摘要 pull；此能力要求 `request_targets_v1`。branch 可省略。下面展示带摘要和并发修订号的完整请求：
 
 ```json
 {
@@ -126,7 +116,7 @@ Nginx root 指向 `/var/www/app/latest`，示例见 `configs/frontend-location.e
 ID、SHA 和 digest 都是占位值。使用既有批量客户端时：
 
 ```bash
-export RELEASE_URLS='http://node-a:8081,http://node-b:8081'
+export RELEASE_URLS='http://node-a:9166,http://node-b:9166'
 export RELEASE_ENV=uat RELEASE_TYPE=frontend_static
 export RELEASE_SERVER_NAME=app RELEASE_PATH_DEST=/var/www
 export RELEASE_ARTIFACT_DIGEST="$(cat ../artifact-bundle/artifact.digest)"
@@ -149,7 +139,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-frontend.json
 | 7 | 原子提交状态和发布结果 | 不确定时标记 recovery_required，停止后续发布 |
 | 8 | 全部节点成功后，CI 更新展示用 prod tag | 仅展示指针滞后，记录告警并修复 |
 
-临时软链和 latest 位于同一父目录；服务用 rename 原子替换，不使用可能出现中间缺口的多条 ln/rm 操作。一次发布失败的自动恢复不访问 Harbor；人工撤销批次使用 restore_of，并校验原成功后的 revision，禁止覆盖别人之后的发布。首次部署无旧快照时使用 stop 策略；失败删除新 latest 后仍须通过 initial_health_checks 验证原入口。
+临时软链和 latest 位于同一父目录；服务用 rename 原子替换，不使用可能出现中间缺口的多条 ln/rm 操作。一次发布失败的自动恢复不访问 Harbor；人工撤销批次使用 restore_of，并校验原成功后的 revision，禁止覆盖别人之后的发布。首次部署无旧快照时使用 stop 策略；失败删除新 latest 后验证原 Nginx worker；配置了 initial_health_checks 时同时验证原入口。
 
 ## prod 的意义与权限
 

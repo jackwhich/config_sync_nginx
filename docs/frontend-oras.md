@@ -1,6 +1,6 @@
 # 前端：ORAS 投递 dist.tar.gz
 
-修订日期：2026-09-04。CI 经 HTTPS 代理向 Harbor 推送 OCI 文件制品；云主机上的 Go HTTP 服务调用独立 ORAS 二进制拉取、解包、原子切换软链，再验证指定的独立 Nginx。整个流程不需要 Docker daemon，也不运行容器。
+修订日期：2026-09-04。CI 经 HTTPS 代理向 Harbor 推送 OCI 文件制品；云主机上的 Go HTTP 服务调用独立 ORAS 二进制拉取、解包、原子切换软链，再执行已有的 `nginx -t`，通过后执行 `nginx -s reload`。整个流程不需要 Docker daemon，也不运行容器。
 
 按本次目录约定，实际布局为：
 
@@ -69,7 +69,7 @@ oras push "$HARBOR_REPOSITORY:$RELEASE_COMMIT" \
 
 ## 云主机：一次性配置
 
-安装独立 Nginx、ORAS 1.3.x 和 Go 编译得到的发布服务。使用仅有目标仓库 pull 权限的 Robot 预置认证文件：
+云主机沿用已有独立 Nginx，准备 ORAS 1.3.x 和 Go 编译得到的发布服务。使用仅有目标仓库 pull 权限的 Robot 预置认证文件：
 
 ```bash
 install -d -m 0700 /etc/nginx-release
@@ -93,7 +93,7 @@ targets:
   - frontend_static
 ```
 
-`{server_name}` 替换为 params 中的站点名；也可写完整固定仓库名。Nginx 已有 root 指向 `/var/www/app/latest`，示例见 `configs/frontend-location.example.conf`。运行中的单实例自动识别，无需 nginx 路径块。默认执行 nginx -t、reload、新 worker 和本地文件摘要验证；实际业务 HTTP 验证可通过高级逐站点配置启用，见 [请求配置约定](request-targets.md)。
+`{server_name}` 替换为 params 中的站点名；也可写完整固定仓库名。Nginx 已有 root 指向 `/var/www/app/latest`，示例见 `configs/frontend-location.example.conf`。服务无需 nginx 路径块，调用已有 `nginx -t`，通过后执行 `nginx -s reload` 并验证本地文件；可选 HTTP 探测通过高级逐站点配置启用，见 [请求配置约定](request-targets.md)。
 
 ## HTTP 发布与恢复
 
@@ -135,11 +135,11 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-frontend.json
 | 3 | 预检全部节点、保存请求 UUID 与各节点基线 | 不发送发布请求 |
 | 4 | 节点查验固定 digest manifest，oras pull 到独立临时目录，检查与解包 | 删除临时半包，latest 不变 |
 | 5 | 建立 `<server_name>/<完整SHA>` 不可变快照，持久化切换意图 | latest 不变 |
-| 6 | 新建随机临时软链，原子 rename 为 latest；测试/reload/worker/HTTP 验证 | 切回本节点旧快照，重新 reload 并验证 |
+| 6 | 新建随机临时软链，原子 rename 为 latest；执行 nginx -t，通过后 nginx -s reload，校验本地文件（以及可选 HTTP 探测） | 切回本节点旧快照，再次执行 nginx -t，通过后 nginx -s reload 并校验旧快照 |
 | 7 | 原子提交状态和发布结果 | 不确定时标记 recovery_required，停止后续发布 |
 | 8 | 全部节点成功后，CI 更新展示用 prod tag | 仅展示指针滞后，记录告警并修复 |
 
-临时软链和 latest 位于同一父目录；服务用 rename 原子替换，不使用可能出现中间缺口的多条 ln/rm 操作。一次发布失败的自动恢复不访问 Harbor；人工撤销批次使用 restore_of，并校验原成功后的 revision，禁止覆盖别人之后的发布。首次部署无旧快照时使用 stop 策略；失败删除新 latest 后验证原 Nginx worker；配置了 initial_health_checks 时同时验证原入口。
+临时软链和 latest 位于同一父目录；服务用 rename 原子替换，不使用可能出现中间缺口的多条 ln/rm 操作。一次发布失败的自动恢复不访问 Harbor；人工撤销批次使用 restore_of，并校验原成功后的 revision，禁止覆盖别人之后的发布。首次部署无旧快照时使用 stop 策略；失败删除新 latest 后执行 nginx -t，通过后再次执行 nginx -s reload；配置了 initial_health_checks 时验证原入口。
 
 ## prod 的意义与权限
 

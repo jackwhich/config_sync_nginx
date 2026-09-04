@@ -76,7 +76,7 @@ targets:
 
 repository 包含 Harbor 主机地址、项目和仓库名，不带协议头、tag 或 digest。可以直接写固定仓库，也可使用唯一支持的占位符 `{server_name}`。HTTP 请求不能指定任意仓库或凭据。
 
-前端只传完整 commit_id 时，服务读取 `<repository>:<完整 SHA>` 的 manifest，验证 revision annotation 和制品结构，计算确切 digest，再按 `<repository>@sha256:...` 拉取和验包。结果和状态保存实际 digest。也支持由 CI 直接传 artifact_digest；批量客户端仍要求 CI 提供固定摘要，以确保多个节点使用同一份制品。prod 不参与机器拉取。
+前端只传完整 commit_id 时，服务读取 `<repository>:<完整 SHA>` 的 manifest，验证 revision annotation 和制品结构，计算确切 digest，再按 `<repository>@sha256:...` 拉取和验包。结果和状态保存实际 digest。也支持由 CI 直接传 artifact_digest；批量客户端省略时，由首台节点解析并返回摘要，客户端先持久化，再将它传给尚未发布的节点，保证同批次使用相同制品。prod 不参与机器拉取。
 
 前端落盘为 `<path_dest>/<server_name>/<完整 SHA>`，`latest` 与 SHA 目录同级。完整制品约束、CI 推送和认证初始化见 [ORAS 设计](frontend-oras.md)。
 
@@ -138,3 +138,5 @@ restore_of 撤销批次仍要求 expected_state_revision，以确认没有其他
 reload 失败的错误码为 `NGINX_RELOAD_FAILED`。若旧配置检查或恢复 reload 也失败，返回 HTTP 503、`status: recovery_required`、`error_code: RECOVERY_FAILED`；error 同时保留原始失败和恢复失败详情，目标禁止继续发布。
 
 `scripts/release_http.py` 将 error_code 和 error 输出到 Jenkins 控制台，并保存到批次 JSON。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 的 `sh` 直接传播该失败。自行用 curl 调用时使用 `--fail-with-body`，同时保留错误响应并以非零码结束，避免把 HTTP 500 当成脚本成功。
+
+Jenkinsfile 的构建参数与 HTTP 字段映射、前端摘要固定和恢复方式见 [Jenkins 发布说明](jenkins.md)。

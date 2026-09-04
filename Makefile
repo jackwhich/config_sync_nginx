@@ -24,7 +24,7 @@ _dist:
 	cp configs/service.example.yaml configs/service.advanced.example.yaml configs/frontend-service.example.yaml configs/frontend-location.example.conf configs/prometheus-*.yml $(PKG_ROOT)/configs/
 	cp scripts/release-apply.sh scripts/release_http.py scripts/frontend-manifest.py scripts/frontend-artifact.sh $(PKG_ROOT)/scripts/
 	cp deploy/nginx-updata-config.service $(PKG_ROOT)/deploy/
-	cp docs/frontend-oras.md docs/request-targets.md $(PKG_ROOT)/docs/
-	cp README.md edge-sync-agent-design-v3.md $(PKG_ROOT)/
+	cp docs/frontend-oras.md docs/request-targets.md docs/jenkins.md $(PKG_ROOT)/docs/
+	cp Jenkinsfile README.md edge-sync-agent-design-v3.md $(PKG_ROOT)/
 	printf '%s\n' 'HTTP release contract 2 — $(VERSION) linux/$(ARCH)' > $(PKG_ROOT)/VERSION
 	tar -C $(DIST_DIR) -czf $(DIST_DIR)/$(PKG_NAME).tar.gz $(PKG_NAME)

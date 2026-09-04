@@ -109,8 +109,13 @@ def require(code, result, expected=200):
 
 
 def require_frontend_capability(health, request):
-    if request.get("type") == "frontend_static" and "frontend_oras_v1" not in health.get("capabilities", []):
+    if request.get("type") != "frontend_static":
+        return
+    capabilities = health.get("capabilities", [])
+    if "frontend_oras_v1" not in capabilities:
         raise ReleaseError("node does not support pinned ORAS frontend artifacts")
+    if not request.get("artifact_digest") and "request_targets_v1" not in capabilities:
+        raise ReleaseError("node does not support frontend SHA tag resolution")
 
 
 def preflight(http, urls, request):
@@ -239,6 +244,36 @@ def restore_batch(http, batch, path, resolve_timeout=120):
     atomic_save(path, batch)
 
 
+def prepare_frontend_node(batch, node, path):
+    request = node["request"]
+    pinned = batch.get("artifact_digest")
+    if request["type"] != "frontend_static" or not pinned:
+        return
+    supplied = request.get("artifact_digest")
+    if supplied and supplied != pinned:
+        raise ReleaseError("frontend request digest differs from the batch: " + node["url"])
+    if not supplied and node.get("result", {}).get("status") not in TERMINAL:
+        # Never alter a request that may already have reached a node: its UUID
+        # must remain bound to its original parameters across resume/recovery.
+        if node.get("phase") != "prepared":
+            raise ReleaseError("cannot change an unresolved frontend request: " + node["url"])
+        request["artifact_digest"] = pinned
+        atomic_save(path, batch)
+
+
+def record_frontend_digest(batch, node, result, path):
+    if node["request"]["type"] != "frontend_static":
+        return
+    digest = result.get("artifact_digest", "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ReleaseError("frontend result is missing a valid artifact digest: " + node["url"])
+    for expected in (batch.get("artifact_digest"), node["request"].get("artifact_digest")):
+        if expected and digest != expected:
+            raise ReleaseError("frontend result digest differs from the batch: " + node["url"])
+    batch["artifact_digest"] = digest
+    atomic_save(path, batch)
+
+
 def update_batch(http, batch, path, resolve_timeout=120):
     if batch.get("phase") in {"restoring", "restored"}:
         raise ReleaseError("batch is being restored; use rollback to continue")
@@ -246,9 +281,11 @@ def update_batch(http, batch, path, resolve_timeout=120):
     atomic_save(path, batch)
     try:
         for node in batch["nodes"]:
+            prepare_frontend_node(batch, node, path)
             result = execute_node(http, batch, node, path, resolve_timeout=resolve_timeout)
             if result.get("status") not in {"succeeded", "skipped"}:
                 raise ReleaseError("publication failed on " + node["url"] + ": " + failure_detail(result))
+            record_frontend_digest(batch, node, result, path)
     except ReleaseError as exc:
         batch["phase"], batch["error"] = "incomplete", str(exc)
         atomic_save(path, batch)
@@ -287,25 +324,37 @@ def main():
             batch = json.loads(path.read_text())
             if batch.get("schema") != 2 or not batch.get("nodes"):
                 raise ReleaseError("not a contract-2 batch record")
+            expected_env = os.getenv("RELEASE_ENV", "").strip()
+            if expected_env and batch.get("env") != expected_env:
+                raise ReleaseError("RELEASE_ENV differs from the original batch environment")
             for node in batch["nodes"]:
                 check_url(node["url"])
         else:
             if args.action != "update":
                 raise ReleaseError("resume/rollback requires the original batch file")
             values = {key: os.getenv(key, "").strip() for key in ("RELEASE_URLS", "RELEASE_ENV", "RELEASE_TYPE", "RELEASE_BRANCH", "RELEASE_COMMIT", "RELEASE_PATH_DEST", "RELEASE_SERVER_NAME")}
-            if values["RELEASE_TYPE"] == "frontend_static" and not values["RELEASE_BRANCH"]:
-                values["RELEASE_BRANCH"] = "artifact"
-            if not all(values.values()):
-                raise ReleaseError("required environment: " + ", ".join(key for key, value in values.items() if not value))
+            missing = [key for key, value in values.items() if key != "RELEASE_BRANCH" and not value]
+            if missing:
+                raise ReleaseError("required environment: " + ", ".join(missing))
+            if values["RELEASE_TYPE"] not in {"config", "whitelist", "frontend_static"}:
+                raise ReleaseError("RELEASE_TYPE must be config, whitelist or frontend_static")
+            if not values["RELEASE_PATH_DEST"].startswith("/"):
+                raise ReleaseError("RELEASE_PATH_DEST must be an absolute path")
             if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", values["RELEASE_COMMIT"]):
                 raise ReleaseError("RELEASE_COMMIT must be a full commit ID")
             request = {"env": values["RELEASE_ENV"], "type": values["RELEASE_TYPE"], "branch": values["RELEASE_BRANCH"], "commit_id": values["RELEASE_COMMIT"].lower(), "project": os.getenv("RELEASE_PROJECT", ""), "version": os.getenv("RELEASE_VERSION", ""), "operator": os.getenv("BUILD_USER_ID", ""), "build_url": os.getenv("BUILD_URL", ""), "params": {"path_dest": values["RELEASE_PATH_DEST"], "server_name": values["RELEASE_SERVER_NAME"]}}
             if request["type"] == "frontend_static":
-                digest = os.getenv("RELEASE_ARTIFACT_DIGEST", "").strip()
-                if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-                    raise ReleaseError("RELEASE_ARTIFACT_DIGEST must be a pinned sha256 OCI digest")
+                request.pop("branch", None)
+            elif not request["branch"]:
+                request.pop("branch")
+            digest = os.getenv("RELEASE_ARTIFACT_DIGEST", "").strip()
+            if digest:
+                if request["type"] != "frontend_static" or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                    raise ReleaseError("RELEASE_ARTIFACT_DIGEST requires frontend_static and a sha256 OCI digest")
                 request["artifact_digest"] = digest
             urls = [url for url in re.split(r"[\s,]+", values["RELEASE_URLS"]) if url]
+            if not urls:
+                raise ReleaseError("RELEASE_URLS must contain at least one service URL")
             nodes = preflight(http, urls, request)
             if args.failure_policy == "restore" and any(not node["before"].get("current") for node in nodes):
                 raise ReleaseError("restore policy requires an existing baseline on every node; first deployment must use stop policy")

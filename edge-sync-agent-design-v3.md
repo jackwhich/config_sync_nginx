@@ -240,7 +240,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 当前 `scripts/release_http.py` 是可选批量客户端，使用 Python 标准库；shell 文件是入口。保留 Python 的原因是该工具实现了逐节点批次落盘、未知结果查询和安全恢复，而不是服务端还存在 Agent。`scripts/frontend-manifest.py` 只用于可选 shared_assets 模式；普通 ORAS dist 使用 shell 打包推送，不需要这个 Python 工具。只需直接 HTTP 调用时，可以使用 curl、Jenkins 或其他语言；采用自建客户端仍需遵守以下持久化与恢复约束。
 
-客户端配置 RELEASE_URLS、ENV、TYPE、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token；Git 类型提供 BRANCH，前端提供 RELEASE_ARTIFACT_DIGEST。新前端预检还要求 frontend_oras_v1 能力。
+客户端配置 RELEASE_URLS、ENV、TYPE、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token；Git 类型可提供 BRANCH，前端可提供 RELEASE_ARTIFACT_DIGEST。新前端预检要求 frontend_oras_v1；省略摘要还要求 request_targets_v1。首台返回确切摘要后先持久化，再写入尚未发布节点的请求；保留首台原请求参数供 UUID 重放。
 
 新批次先预检全部节点、确认 node_id 不重复，再把每个节点 target_id、baseline（前端含原 artifact_digest）、revision、原 UUID 和完整请求原子写到批次文件。持久化成功后才发送 HTTP。
 
@@ -248,7 +248,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 update 只接受新批次文件，resume 从原记录继续，rollback 从同一记录逆序恢复各节点自己的基线。节点身份、当前 revision 和服务能力会再次校验。批次文件有独立进程锁，并原子更新；不保存 Token。
 
-Jenkins 禁止同 Job 并发，归档批次文件。resume/rollback 通过 SOURCE_BUILD 读取原构建文件，示例依赖 Copy Artifact 插件。COMMIT_ID 必须显式填写制品仓库提交，不能默认使用 Jenkinsfile 所在仓库的 GIT_COMMIT。
+Jenkins 禁止同 Job 并发，归档批次文件。resume/rollback 通过 SOURCE_BUILD 读取原构建文件，示例依赖 Copy Artifact 插件。COMMIT_ID 必须显式填写制品仓库提交，不能默认使用 Jenkinsfile 所在仓库的 GIT_COMMIT。环境、类型、分支、站点、绝对路径和节点 HTTP 地址全部参数化；Token 由 Secret text 凭据注入。resume/rollback 使用原批次参数，并拒绝 DEPLOY_ENV 与原环境不一致。前端构建/push 在应用 CI 完成，本 Job 负责 HTTP 发布。详见 [Jenkins 发布说明](docs/jenkins.md)。
 
 ## 十一、可观测性
 

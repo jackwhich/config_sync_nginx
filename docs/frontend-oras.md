@@ -119,7 +119,8 @@ ID、SHA 和 digest 都是占位值。使用既有批量客户端时：
 export RELEASE_URLS='http://node-a:9166,http://node-b:9166'
 export RELEASE_ENV=uat RELEASE_TYPE=frontend_static
 export RELEASE_SERVER_NAME=app RELEASE_PATH_DEST=/var/www
-export RELEASE_ARTIFACT_DIGEST="$(cat ../artifact-bundle/artifact.digest)"
+# 可选：应用 CI 已持有摘要时直接指定。留空由首台节点解析并固定后续节点摘要。
+# export RELEASE_ARTIFACT_DIGEST="$(cat ../artifact-bundle/artifact.digest)"
 # RELEASE_COMMIT 是构建前保存的完整 SHA；RELEASE_TOKEN 从 CI 凭据注入。
 bash scripts/release-apply.sh update --batch-file release-batch-frontend.json
 # 断线：使用原记录和原 UUID 查询/恢复，不创建新批次。
@@ -127,6 +128,8 @@ bash scripts/release-apply.sh resume --batch-file release-batch-frontend.json
 # 恢复：按每个节点自己的本地基线及原 artifact_digest 执行。
 bash scripts/release-apply.sh rollback --batch-file release-batch-frontend.json
 ```
+
+[Jenkinsfile](../Jenkinsfile) 支持 frontend_static 参数发布，Harbor pull 地址保留在节点配置；该 Job 不承担前端源码构建和 push。省略摘要时客户端固定首台返回摘要后再发布后续节点，完整参数见 [Jenkins 发布说明](jenkins.md)。
 
 | 顺序 | 动作 | 失败处理 |
 | --- | --- | --- |

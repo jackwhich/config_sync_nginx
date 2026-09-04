@@ -169,7 +169,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 默认失败策略为 `stop`，可在新批次开始前指定 `--failure-policy restore`。后者要求每台节点已有可恢复快照；首次部署使用 stop 并事先确定人工退出策略。未知结果未确认之前不启动任何恢复。恢复失败或基线变化会停止处理，保留记录供排查。
 
-保存批次文件到持久存储，文件内没有令牌。Jenkins 示例会归档该文件，resume/rollback 用 `SOURCE_BUILD` 读取原构建记录，需要 **Copy Artifact** 插件。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
+保存批次文件到持久存储，文件内没有令牌。[Jenkinsfile](Jenkinsfile) 的环境、类型、分支、完整 SHA、站点、部署路径和节点 HTTP 地址都由构建参数传入；Token 通过 Jenkins Secret text 凭据注入。它会归档批次文件，resume/rollback 用 `SOURCE_BUILD` 读取原构建记录，并校验所选环境一致，需要 **Copy Artifact** 插件。具体参数和使用方式见 [Jenkins 发布说明](docs/jenkins.md)。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
 
 ## 前端 ORAS 制品发布
 
@@ -193,7 +193,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 普通 dist 模式 `shared_assets: false` 只要求根目录有非空 index.html，允许 app.js、favicon.ico 等普通资源，不再要求 Python 清单工具。服务仍检查发现的本地静态引用。旧页面懒加载兼容需另外启用 `shared_assets: true`、共享 /assets 路由和哈希资源清单；旧 SHA 目录留在磁盘不会自动保证旧 URL 可达。
 
-批量客户端仍支持 update/resume/rollback。前端额外设置 `RELEASE_ARTIFACT_DIGEST`；恢复时从每节点原始基线读取自己的 digest，不重新拉取 Harbor。
+批量客户端支持 update/resume/rollback。前端 `RELEASE_ARTIFACT_DIGEST` 可选；省略时首台节点按完整 SHA 解析摘要，客户端先持久化该摘要，再用于后续节点，保证同批次使用相同制品。恢复时从每节点原始基线读取自己的 digest，不重新拉取 Harbor。
 
 ## JSON 日志与告警
 

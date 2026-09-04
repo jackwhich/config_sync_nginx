@@ -129,7 +129,7 @@ bash scripts/release-apply.sh resume --batch-file release-batch-frontend.json
 bash scripts/release-apply.sh rollback --batch-file release-batch-frontend.json
 ```
 
-[Jenkinsfile](../Jenkinsfile) 支持 frontend_static 参数发布，Harbor pull 地址保留在节点配置；该 Job 不承担前端源码构建和 push。省略摘要时客户端固定首台返回摘要后再发布后续节点，完整参数见 [Jenkins 发布说明](jenkins.md)。
+仓库根目录 [Jenkinsfile](../Jenkinsfile) 用于配置/白名单 update，不承担前端回滚。前端 Harbor pull 地址保留在节点配置；应用 CI 完成构建和 push 后，用 HTTP 客户端或单独的前端 Job 发布。省略摘要时客户端固定首台返回摘要后再发布后续节点。
 
 | 顺序 | 动作 | 失败处理 |
 | --- | --- | --- |

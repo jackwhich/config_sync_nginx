@@ -248,7 +248,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 update 只接受新批次文件，resume 从原记录继续，rollback 从同一记录逆序恢复各节点自己的基线。节点身份、当前 revision 和服务能力会再次校验。批次文件有独立进程锁，并原子更新；不保存 Token。
 
-Jenkins 禁止同 Job 并发，归档批次文件。resume/rollback 通过 SOURCE_BUILD 读取原构建文件，示例依赖 Copy Artifact 插件。COMMIT_ID 必须显式填写制品仓库提交，不能默认使用 Jenkinsfile 所在仓库的 GIT_COMMIT。环境、类型、分支、站点、绝对路径和节点 HTTP 地址全部参数化；Token 由 Secret text 凭据注入。resume/rollback 使用原批次参数，并拒绝 DEPLOY_ENV 与原环境不一致。前端构建/push 在应用 CI 完成，本 Job 负责 HTTP 发布。详见 [Jenkins 发布说明](docs/jenkins.md)。
+Jenkins 禁止同 Job 并发，归档批次文件。配置/白名单 Job 只提供 update 和 SERVER_NAME；commit_id 使用当前 Job 检出的 GitLab 仓库 GIT_COMMIT。环境、类型、目录和节点地址写在流水线中。回滚只用于前端发布 Job。详见 [Jenkins 发布说明](docs/jenkins.md)。
 
 ## 十一、可观测性
 

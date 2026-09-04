@@ -1,0 +1,84 @@
+---
+- block:
+  # 清单目录创建
+  - name: 创建目录存放清单
+    file: path={{ item }} mode=0755 state=directory owner=www group=www
+    with_items:
+    - "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/"
+
+  - name: "打印更新的文件或目录"
+    debug:
+     msg: |
+       "SRC: {{ path_src }}"
+       "DEST: {{ path_dest }}"
+  
+  - name: "同步最新配置{{ type }}到nginx"
+    synchronize:
+      src: "{{ path_src }}/"
+      dest: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ SERVER_NAME }}"
+      recursive: yes
+      delete: yes
+      times: yes
+      rsync_opts: "--exclude=.git/"
+      mode: push
+    register: "rsync_logs"
+  
+  - name: "打印同步的文件"
+    debug:
+     msg:  "{{ rsync_logs.stdout_lines | join('\n') }}"
+
+  - name: "备份{{ check_commitID }}"
+    synchronize:
+      src: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ SERVER_NAME }}/"
+      dest: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ check_commitID }}"
+      recursive: yes
+      delete: yes
+      times: no
+      rsync_opts: "--exclude=.git/"
+      mode: push
+    delegate_to: "{{ inventory_hostname }}"
+
+  - name: 设置目录权限
+    file: path={{ item }} mode=0755 state=directory owner=www group=www recurse=yes
+    with_items:
+    - "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/"
+
+  # 更新data软连接
+  - name: "更新{{ SERVER_NAME }}软连接到{{ check_commitID }}"
+    file:
+      src: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ check_commitID }}"
+      dest: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/latest"
+      state: "link"
+      force: "yes"
+    notify:
+      - "执行 nginx -t测试"
+
+  - name: "执行handlers"
+    meta: flush_handlers 
+  tags: update
+  become: True
+  
+- block:
+  - name: 查找{{ type }}上一版本
+    shell: "find {{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/* -maxdepth 0 -type d| \
+    grep -wvE '{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ check_commitID }}$|{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/{{ SERVER_NAME }}$'| \
+    xargs ls -td|head -1"
+    register: "latest_ID"
+  
+  - name: 打印回退版本
+    debug:
+      msg: "ID: {{ latest_ID.stdout }}"
+
+  - name: "回滚{{ type }}软连接"
+    become: True
+    file:
+      src: "{{ latest_ID.stdout }}"
+      dest: "{{ path_dest }}/{{ type }}/{{ SERVER_NAME }}/latest"
+      state: "link"
+      force: "yes"
+    notify:
+      - "执行 nginx -t测试"
+
+  - name: "执行handlers"
+    meta: flush_handlers 
+  tags: rollback

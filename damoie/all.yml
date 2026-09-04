@@ -1,0 +1,26 @@
+# 格式化时间戳
+timestamp: "{{lookup('pipe', 'date +%Y-%m-%d-%H-%M')}}" 
+
+# config: 更新配置文件，white：更新白名单
+type: whitelist
+
+# delegate_to主机
+jump_server: localhost
+
+project: /1111
+commit_id: 
+
+# nginx配置文件目录
+path:
+#  vhost: /usr/local/openresty/nginx/conf/vhost
+  whitelist: /data/dc-nginx
+  backup: /data/nginx-conf-bak
+  src:
+
+# 云主机更新开关
+sync_cloud: False
+
+# 同步路径
+path_dest: /data/wwwroot
+path_src: "{{ WORKSPACE }}/dist"
+DEPLOY_HOSTS: "{{ SERVER_NAME }}"

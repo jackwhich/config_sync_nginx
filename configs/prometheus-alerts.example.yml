@@ -21,3 +21,40 @@ groups:
           severity: critical
         annotations:
           summary: 'Publication blocked on {{ $labels.node_id }}; inspect /healthz and release state'
+      - alert: NginxHTTPReleaseStepFailed
+        expr: increase(nginx_updata_config_release_step_failures_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Publication step {{ $labels.step }} failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseRollbackFailed
+        expr: increase(nginx_updata_config_rollback_total{status="failed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Local rollback failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseStateWriteFailed
+        expr: increase(nginx_updata_config_state_persist_failures_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Publication state write failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseCleanupFailed
+        expr: increase(nginx_updata_config_cleanup_failures_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Publication cleanup failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseStuck
+        expr: (nginx_updata_config_release_in_progress == 1) and (time() - nginx_updata_config_release_started_timestamp_seconds > 600)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Publication running for over 10 minutes on {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseAccessDenied
+        expr: sum by (job, instance) (increase(nginx_updata_config_http_requests_total{code=~"401|403"}[5m])) >= 10
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Repeated denied publication requests on {{ $labels.instance }}'

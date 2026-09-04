@@ -6,7 +6,7 @@ env: uat
 data_dir: /var/lib/nginx-release
 # 同一台机器、同一 Nginx 实例的所有服务进程必须使用同一个锁文件和 data_dir。
 lock_file: /var/lock/nginx-release.lock
-log_file: ""  # JSON 日志输出到 stdout，由 systemd 收集
+log_file: ""  # JSON Lines 到 stdout；time/level/message，访问日志含 client_ip/status_code
 release_auth_tokens:
   uat: replace-with-uat-release-token
 allowed_client_ips:

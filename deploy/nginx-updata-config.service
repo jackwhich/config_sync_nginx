@@ -1,0 +1,22 @@
+[Unit]
+Description=Nginx synchronous HTTP release service
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/nginx-release/bin/nginx_updata_config -config /etc/nginx-release/service.yaml
+WorkingDirectory=/opt/nginx-release
+Restart=on-failure
+RestartSec=5
+# Default maximum work + recovery + shutdown margin is below 9 minutes.
+# Increase this if service.yaml timeouts are increased.
+TimeoutStopSec=10min
+KillMode=mixed
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

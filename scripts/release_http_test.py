@@ -127,6 +127,12 @@ class BatchTests(unittest.TestCase):
             client.restore_batch(self.http, self.batch, self.path)
         self.assertEqual(len(self.http.calls), 2)
 
+    def test_frontend_requires_oras_capability_before_any_post(self):
+        request = dict(self.batch["nodes"][0]["request"], type="frontend_static", artifact_digest="sha256:" + "a" * 64)
+        with self.assertRaisesRegex(client.ReleaseError, "ORAS"):
+            client.preflight(self.http, ["http://a"], request)
+        self.assertEqual(self.http.calls, [])
+
     def test_tokens_not_written_to_batch(self):
         client.update_batch(self.http, self.batch, self.path)
         self.assertNotIn("release_token", self.path.read_text().lower())

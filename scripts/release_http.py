@@ -103,6 +103,11 @@ def require(code, result, expected=200):
     return result
 
 
+def require_frontend_capability(health, request):
+    if request.get("type") == "frontend_static" and "frontend_oras_v1" not in health.get("capabilities", []):
+        raise ReleaseError("node does not support pinned ORAS frontend artifacts")
+
+
 def preflight(http, urls, request):
     nodes, seen = [], set()
     for url in urls:
@@ -110,6 +115,7 @@ def preflight(http, urls, request):
         health = require(*http.call(url, "/healthz"))
         if health.get("release_contract") != 2 or health.get("publish_ready") is not True:
             raise ReleaseError(url + " is not ready for HTTP release contract 2")
+        require_frontend_capability(health, request)
         node_id = health.get("node_id")
         if not node_id or node_id in seen or health.get("env") != request["env"]:
             raise ReleaseError("duplicate/missing node_id or environment mismatch: " + url)
@@ -126,6 +132,7 @@ def preflight(http, urls, request):
 
 def identity(http, node, env):
     health = require(*http.call(node["url"], "/healthz"))
+    require_frontend_capability(health, node["request"])
     if health.get("release_contract") != 2 or health.get("node_id") != node["node_id"] or health.get("env") != env:
         raise ReleaseError("endpoint identity or contract changed: " + node["url"])
 
@@ -215,6 +222,10 @@ def restore_batch(http, batch, path, resolve_timeout=120):
             if live["state_revision"] != result["state_revision_after"] or live.get("current_commit_id") != result["commit_id"]:
                 raise ReleaseError("baseline changed; later deployment must not be overwritten: " + node["url"])
             node["restore_request"] = dict(node["request"], release_id=str(uuid.uuid4()), expected_state_revision=result["state_revision_after"], restore_of=node["request"]["release_id"], commit_id=baseline["commit_id"], version=baseline["version"])
+            if node["request"]["type"] == "frontend_static":
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", baseline.get("artifact_digest", "")):
+                    raise ReleaseError("baseline is missing the original artifact digest")
+                node["restore_request"]["artifact_digest"] = baseline["artifact_digest"]
             atomic_save(path, batch)
         restored = execute_node(http, batch, node, path, "restore_request", "restore_result", resolve_timeout)
         if restored.get("status") != "succeeded":
@@ -274,11 +285,18 @@ def main():
             if args.action != "update":
                 raise ReleaseError("resume/rollback requires the original batch file")
             values = {key: os.getenv(key, "").strip() for key in ("RELEASE_URLS", "RELEASE_ENV", "RELEASE_TYPE", "RELEASE_BRANCH", "RELEASE_COMMIT", "RELEASE_PATH_DEST", "RELEASE_SERVER_NAME")}
+            if values["RELEASE_TYPE"] == "frontend_static" and not values["RELEASE_BRANCH"]:
+                values["RELEASE_BRANCH"] = "artifact"
             if not all(values.values()):
                 raise ReleaseError("required environment: " + ", ".join(key for key, value in values.items() if not value))
             if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", values["RELEASE_COMMIT"]):
                 raise ReleaseError("RELEASE_COMMIT must be a full commit ID")
             request = {"env": values["RELEASE_ENV"], "type": values["RELEASE_TYPE"], "branch": values["RELEASE_BRANCH"], "commit_id": values["RELEASE_COMMIT"].lower(), "project": os.getenv("RELEASE_PROJECT", ""), "version": os.getenv("RELEASE_VERSION", ""), "operator": os.getenv("BUILD_USER_ID", ""), "build_url": os.getenv("BUILD_URL", ""), "params": {"path_dest": values["RELEASE_PATH_DEST"], "server_name": values["RELEASE_SERVER_NAME"]}}
+            if request["type"] == "frontend_static":
+                digest = os.getenv("RELEASE_ARTIFACT_DIGEST", "").strip()
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                    raise ReleaseError("RELEASE_ARTIFACT_DIGEST must be a pinned sha256 OCI digest")
+                request["artifact_digest"] = digest
             urls = [url for url in re.split(r"[\s,]+", values["RELEASE_URLS"]) if url]
             nodes = preflight(http, urls, request)
             if args.failure_policy == "restore" and any(not node["before"].get("current") for node in nodes):

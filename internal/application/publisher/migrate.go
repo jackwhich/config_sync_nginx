@@ -56,11 +56,6 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if target.Type == release.ReleaseTypeFrontendStatic {
 		return fmt.Errorf("frontend ORAS migration requires a new empty target and explicit Nginx root cutover; old Git snapshots are not adopted")
 	}
-	resolved, err := nginx.Discover(ctx, cfg.Nginx)
-	if err != nil {
-		return err
-	}
-	cfg.Nginx = resolved
 	nl, e := lock.Open(cfg.LockFile)
 	if e != nil {
 		return e
@@ -151,7 +146,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if seen != len(manifest.Files)-1 {
 		return fmt.Errorf("legacy is missing source files (the generated .release-version is excluded)")
 	}
-	rt := &nginx.Runtime{Config: cfg}
+	rt := &nginx.Runtime{}
 	if e = rt.Test(ctx); e != nil {
 		return e
 	}
@@ -174,7 +169,8 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if e = fsutil.Switch(base, candidate.Link); e != nil {
 		return e
 	}
-	if e = rt.Test(ctx); e == nil {
+	e = rt.Test(ctx)
+	if e == nil {
 		e = rt.Reload(ctx)
 	}
 	if e == nil {
@@ -191,7 +187,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	st.RecoveryRequired = false
 	rec.Result.Status = release.NodeStatusSucceeded
 	rec.Result.Phase = "complete"
-	rec.Result.ActivationStatus = "verified"
+	rec.Result.ActivationStatus = "reload_requested"
 	rec.Result.StateRevisionAfter = st.Revision
 	rec.Result.FinishedAt = time.Now().UTC()
 	rec.HTTPStatus = 200

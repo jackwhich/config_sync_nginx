@@ -64,7 +64,7 @@ func TestPublicationFailureMetricsAndReplay(t *testing.T) {
 	f.rt.test = func(context.Context) error {
 		calls++
 		if calls == 1 {
-			return errors.New("syntax failure")
+			return errors.New("nginx -t failed")
 		}
 		return nil
 	}

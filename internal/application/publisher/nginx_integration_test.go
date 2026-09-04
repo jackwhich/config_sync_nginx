@@ -2,133 +2,157 @@ package publisher
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"nginx_updata_config/internal/infrastructure/nginx"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"nginx_updata_config/internal/config"
 	"nginx_updata_config/internal/domain/release"
-	"nginx_updata_config/internal/infrastructure/process"
 )
 
-// Opt-in integration test. The binary must already be installed by the operator.
-// The test creates a dedicated master, config, PID file, listen port and deployment tree.
-func TestRealNginxActivationAndRecovery(t *testing.T) {
-	binary := os.Getenv("NGINX_TEST_BINARY")
-	if binary == "" {
-		t.Skip("set NGINX_TEST_BINARY to run against a dedicated real Nginx instance")
-	}
-	if !filepath.IsAbs(binary) {
-		t.Fatal("NGINX_TEST_BINARY must be absolute")
-	}
-	f := newFixture(t)
-	f.r.Close()
-	f.r = nil
-	prefix := t.TempDir()
-	listener, e := net.Listen("tcp4", "127.0.0.1:0")
-	if e != nil {
-		t.Fatal(e)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
-	conf := filepath.Join(prefix, "nginx.conf")
-	pid := filepath.Join(prefix, "nginx.pid")
-	url := fmt.Sprintf("http://127.0.0.1:%d", port)
-	user := ""
-	if os.Geteuid() == 0 {
-		user = "user root;\n"
-	}
-	content := fmt.Sprintf(`%sworker_processes 1;
-error_log %q notice;
-pid %q;
-events { worker_connections 64; }
-http {
- access_log off;
- server {
-  listen 127.0.0.1:%d;
-  location = /.release-version { alias %q; open_file_cache off; }
-  include %q;
- }
-}
-`, user, filepath.Join(prefix, "error.log"), pid, port, filepath.Join(f.cfg.Targets[0].Dir, "latest", ".release-version"), filepath.Join(f.cfg.Targets[0].Dir, "latest", "*.conf"))
-	if e = os.WriteFile(conf, []byte(content), 0600); e != nil {
-		t.Fatal(e)
-	}
-	proc := process.Command(context.Background(), binary, "-c", conf, "-p", prefix, "-g", "daemon off;")
-	output := &process.LimitedBuffer{Limit: 65536}
-	proc.Stdout = output
-	proc.Stderr = output
-	if e = proc.Start(); e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() {
-		_ = syscall.Kill(-proc.Process.Pid, syscall.SIGQUIT)
-		done := make(chan error, 1)
-		go func() { done <- proc.Wait() }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = proc.Cancel()
-			<-done
-		}
-	})
-	f.cfg.Nginx = config.Nginx{Binary: binary, ConfigFile: conf, Prefix: prefix, PIDFile: pid}
-	f.cfg.Targets[0].HealthChecks = []config.HealthCheck{{URL: url + "/.release-version", Contains: "{commit}", Status: 200}}
-	f.cfg.Targets[0].InitialHealthChecks = []config.HealthCheck{{URL: url + "/.release-version", Status: 404}}
-	realRuntime := &nginx.Runtime{Config: f.cfg}
-	wait, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if e = realRuntime.Verify(wait, f.cfg.Targets[0], "", true); e != nil {
-		t.Fatal("Nginx did not start", e)
-	}
-	r, e := NewWithRuntime(f.cfg, realRuntime)
-	if e != nil {
-		t.Fatal(e)
-	}
-	f.r = r
-	a := f.commit(`location = /effect { return 200 "enabled A"; }`)
-	f.apply(a)
-	readEffect := func() string {
-		t.Helper()
-		resp, e := http.Get(url + "/effect")
-		if e != nil {
-			t.Fatal(e)
-		}
-		defer resp.Body.Close()
-		body, e := io.ReadAll(resp.Body)
-		if e != nil {
-			t.Fatal(e)
-		}
-		return string(body)
-	}
-	if readEffect() != "enabled A" {
-		t.Fatal("new workers did not load A")
-	}
-	b := f.commit(`location = /effect { return 200 "enabled B"; }`)
-	f.apply(b)
-	if readEffect() != "enabled B" {
-		t.Fatal("reload did not load B")
-	}
-	invalid := f.commit("invalid_nginx_directive;")
-	res := r.Apply(context.Background(), f.request(invalid))
-	if res.Status != release.NodeStatusFailed || res.RollbackStatus != "succeeded" || readEffect() != "enabled B" {
-		t.Fatalf("real Nginx recovery failed: %+v", res)
-	}
-	// A reload from a syntactically valid release also must be confirmed by live HTTP.
-	wrong := f.commit(`location = /effect { return 200 "enabled C"; }`)
-	original := f.cfg.Targets[0].HealthChecks
-	f.r.cfg.Targets[0].HealthChecks = append(append([]config.HealthCheck(nil), original...), config.HealthCheck{URL: url + "/effect", Contains: "enabled B", Status: 200})
-	f.r.cfg.StepTimeout = config.Duration(300 * time.Millisecond)
-	res = f.r.Apply(context.Background(), f.request(wrong))
-	if res.Status != release.NodeStatusFailed || !strings.Contains(res.Error, "verification") || readEffect() != "enabled B" {
-		t.Fatalf("real HTTP mismatch was not restored: %+v", res)
+// Run the production adapter with a temporary command in PATH. No real Nginx,
+// master process, PID file, server config or signals are used by this test.
+func TestStandardNginxCommandsAndRollback(t *testing.T) {
+	for _, typ := range []release.ReleaseType{release.ReleaseTypeConfig, release.ReleaseTypeWhitelist, release.ReleaseTypeFrontendStatic} {
+		t.Run(string(typ), func(t *testing.T) {
+			f := newFixture(t)
+			f.r.Close()
+			f.r = nil
+			f.cfg.Targets[0].Type = typ
+			f.cfg.Targets[0].HealthChecks = nil
+			f.cfg.Targets[0].InitialHealthChecks = nil
+			if typ == release.ReleaseTypeWhitelist {
+				f.cfg.Repos["whitelist"] = f.cfg.Repos["config"]
+			}
+			if typ == release.ReleaseTypeFrontendStatic {
+				f.cfg.ORAS = config.ORAS{Binary: "/usr/local/bin/oras", RegistryConfig: "/etc/oras/auth.json"}
+				f.cfg.Targets[0].ArtifactRepository = "harbor.example.com/web/site-dist"
+				if err := os.MkdirAll(filepath.Join(f.repo, "site"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(f.repo, "site", "index.html"), []byte("<html>dist</html>"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			toolsDir := t.TempDir()
+			calls := filepath.Join(toolsDir, "calls")
+			links := filepath.Join(toolsDir, "links")
+			fail := filepath.Join(toolsDir, "fail-once")
+			t.Setenv("TEST_NGINX_CALLS", calls)
+			t.Setenv("TEST_NGINX_LINKS", links)
+			t.Setenv("TEST_NGINX_FAIL", fail)
+			syntaxFail := filepath.Join(toolsDir, "syntax-fail-once")
+			t.Setenv("TEST_NGINX_SYNTAX_FAIL", syntaxFail)
+			t.Setenv("TEST_NGINX_LATEST", filepath.Join(f.cfg.Targets[0].Dir, "latest"))
+			t.Setenv("PATH", toolsDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			command := `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_NGINX_CALLS"
+readlink "$TEST_NGINX_LATEST" >> "$TEST_NGINX_LINKS"
+if [ "$#" -eq 1 ] && [ "$1" = '-t' ]; then
+ if [ -f "$TEST_NGINX_SYNTAX_FAIL" ]; then
+  /bin/rm "$TEST_NGINX_SYNTAX_FAIL"
+  echo 'nginx: [emerg] unknown directive "bad_directive" in /etc/nginx/conf.d/site.conf:7' >&2
+  exit 1
+ fi
+elif [ "$#" -eq 2 ] && [ "$1" = '-s' ] && [ "$2" = 'reload' ]; then
+ if [ -f "$TEST_NGINX_FAIL" ]; then
+  /bin/rm "$TEST_NGINX_FAIL"
+  echo 'nginx: reload command failed' >&2
+  exit 1
+ fi
+else
+ exit 19
+fi
+`
+			if err := os.WriteFile(filepath.Join(toolsDir, "nginx"), []byte(command), 0700); err != nil {
+				t.Fatal(err)
+			}
+			// Any attempt to inspect or control host services must fail this test.
+			for _, name := range []string{"ps", "systemctl", "service", "kill"} {
+				if err := os.WriteFile(filepath.Join(toolsDir, name), []byte("#!/bin/sh\nprintf 'forbidden-host-control\\n' >> \"$TEST_NGINX_CALLS\"\nexit 21\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var err error
+			f.r, err = New(f.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typ == release.ReleaseTypeFrontendStatic {
+				f.r.artifacts = fixtureArtifacts{f}
+			}
+			if _, err := os.Stat(calls); !os.IsNotExist(err) {
+				t.Fatal("startup ran a host command", err)
+			}
+			request := func(commit string) release.ApplyRequest {
+				req := f.request(commit)
+				req.Type = typ
+				if typ == release.ReleaseTypeFrontendStatic {
+					req.ArtifactDigest = "sha256:" + release.Digest(commit)
+				}
+				return req
+			}
+			a := f.commit("A")
+			req := request(a)
+			got := f.r.Apply(context.Background(), req)
+			if got.Status != release.NodeStatusSucceeded || got.ActivationStatus != "reload_requested" {
+				t.Fatal(got)
+			}
+			if replay := f.r.Apply(context.Background(), req); !replay.Replayed {
+				t.Fatal(replay)
+			}
+			b := f.commit("B")
+			if err := os.WriteFile(syntaxFail, []byte("reject candidate syntax"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			invalidRequest := request(b)
+			got = f.r.Apply(context.Background(), invalidRequest)
+			if got.Status != release.NodeStatusFailed || got.HTTPStatus != 500 || got.ErrorCode != "NGINX_TEST_FAILED" || got.RollbackStatus != "succeeded" || !strings.Contains(got.Error, "bad_directive") || !strings.Contains(got.Error, "site.conf:7") {
+				t.Fatal(got)
+			}
+			for _, step := range got.Steps {
+				if step.Name == "reload" {
+					t.Fatal("candidate reload must not run after nginx -t failure", got)
+				}
+			}
+			if replay := f.r.Apply(context.Background(), invalidRequest); !replay.Replayed || replay.HTTPStatus != 500 || replay.Error != got.Error {
+				t.Fatal(replay)
+			}
+			if err := os.WriteFile(fail, []byte("fail the candidate command"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got = f.r.Apply(context.Background(), request(b))
+			if got.Status != release.NodeStatusFailed || got.HTTPStatus != 500 || got.ErrorCode != "NGINX_RELOAD_FAILED" || got.RollbackStatus != "succeeded" {
+				t.Fatal(got)
+			}
+			st, link := f.current()
+			if st.Current.CommitID != a || link != f.cfg.Targets[0].SnapshotLink(a) {
+				t.Fatal(st, link)
+			}
+			raw, err := os.ReadFile(calls)
+			if err != nil || string(raw) != "-t\n-s reload\n-t\n-t\n-s reload\n-t\n-s reload\n-t\n-s reload\n" {
+				t.Fatal(string(raw), err)
+			}
+			raw, err = os.ReadFile(links)
+			aLink, bLink := f.cfg.Targets[0].SnapshotLink(a), f.cfg.Targets[0].SnapshotLink(b)
+			want := strings.Join([]string{aLink, aLink, bLink, aLink, aLink, bLink, bLink, aLink, aLink}, "\n") + "\n"
+			if err != nil || string(raw) != want {
+				t.Fatal("test/reload order", string(raw), err)
+			}
+			// Restart validates stored files without executing or discovering Nginx.
+			f.r.Close()
+			f.r, err = New(f.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, _ = os.ReadFile(calls)
+			if strings.Count(string(raw), "\n") != 9 {
+				t.Fatal("restart ran a host command", string(raw))
+			}
+		})
 	}
 }

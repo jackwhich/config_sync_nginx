@@ -44,16 +44,7 @@ type Runner struct {
 	stopping  bool
 }
 
-func New(cfg config.Config) (*Runner, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.StepTimeout.Value())
-	defer cancel()
-	resolved, err := nginx.Discover(ctx, cfg.Nginx)
-	if err != nil {
-		return nil, fmt.Errorf("discover running nginx: %w", err)
-	}
-	cfg.Nginx = resolved
-	return NewWithRuntime(cfg, &nginx.Runtime{Config: cfg})
-}
+func New(cfg config.Config) (*Runner, error) { return NewWithRuntime(cfg, &nginx.Runtime{}) }
 func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 	store, e := statestore.Open(cfg.DataDir)
 	if e != nil {
@@ -223,7 +214,7 @@ func (r *Runner) Health() map[string]any {
 			envs = append(envs, env)
 		}
 	}
-	return map[string]any{"enabled_envs": envs, "status": "ok", "release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1"}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
+	return map[string]any{"enabled_envs": envs, "status": "ok", "release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1", "nginx_commands_v1"}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
 }
 func (r *Runner) Target(id string) (config.Target, bool) {
 	r.mu.RLock()
@@ -343,7 +334,7 @@ func (r *Runner) State(id, releaseID string) (map[string]any, int, error) {
 		}
 	}
 	r.mu.RUnlock()
-	out := map[string]any{"release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1"}, "node_id": r.cfg.NodeID, "env": t.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
+	out := map[string]any{"release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1", "nginx_commands_v1"}, "node_id": r.cfg.NodeID, "env": t.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
 	if st.Current != nil {
 		out["current_commit_id"] = st.Current.CommitID
 	}
@@ -625,9 +616,15 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	})
 	if e == nil {
 		e = r.step(critical, st, rec, "nginx_test", r.runtime.Test)
+		if e != nil {
+			return r.restore(t, st, rec, "NGINX_TEST_FAILED", e)
+		}
 	}
 	if e == nil {
 		e = r.step(critical, st, rec, "reload", r.runtime.Reload)
+		if e != nil {
+			return r.restore(t, st, rec, "NGINX_RELOAD_FAILED", e)
+		}
 	}
 	if e == nil {
 		e = r.step(critical, st, rec, "verify_activation", func(c context.Context) error {
@@ -753,7 +750,7 @@ func (r *Runner) commit(t config.Target, st *state.TargetState, rec *state.Recor
 	st.RecoveryRequired = false
 	rec.Result.Status = release.NodeStatusSucceeded
 	rec.Result.Phase = "complete"
-	rec.Result.ActivationStatus = "verified"
+	rec.Result.ActivationStatus = "reload_requested"
 	rec.Result.RollbackStatus = "not_needed"
 	rec.Result.ErrorCode = ""
 	rec.Result.Error = ""
@@ -854,9 +851,9 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 	if rec.Candidate != nil && link == rec.Candidate.Link {
 		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil {
 			e = r.runtime.Test(ctx)
-			if e == nil {
-				e = r.runtime.Reload(ctx)
-			}
+		}
+		if e == nil {
+			e = r.runtime.Reload(ctx)
 		}
 		if e == nil {
 			e = r.verify(ctx, t, base, rec.Candidate)
@@ -872,7 +869,11 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 		r.uncertain(st, rec, "EXTERNAL_DRIFT", fmt.Errorf("latest no longer matches candidate or baseline"))
 		return
 	}
-	r.restore(t, st, rec, "INTERRUPTED", fmt.Errorf("interrupted activation; restored local baseline"))
+	cause := fmt.Errorf("interrupted activation; restoring local baseline")
+	if e != nil {
+		cause = fmt.Errorf("interrupted activation: %w", e)
+	}
+	r.restore(t, st, rec, "INTERRUPTED", cause)
 }
 
 type errorMarker struct{}

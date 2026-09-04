@@ -55,7 +55,6 @@ func TestTypeOnlyPublishRestartRollbackAndOverlap(t *testing.T) {
 	root := f.cfg.Targets[0].PathDest
 	f.r.Close()
 	f.cfg.Targets = []config.Target{{Type: release.ReleaseTypeConfig}}
-	f.cfg.Nginx = config.Nginx{}
 	repo := f.cfg.Repos["config"]
 	repo.AllowedBranches = nil
 	f.cfg.Repos["config"] = repo

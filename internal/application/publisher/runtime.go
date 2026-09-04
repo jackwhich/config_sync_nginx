@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Runtime is the application boundary for the configured Nginx instance.
+// Runtime tests and reloads via the existing nginx command and runs optional HTTP probes.
 type Runtime interface {
 	Test(context.Context) error
 	Reload(context.Context) error

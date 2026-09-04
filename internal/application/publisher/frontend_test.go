@@ -168,7 +168,7 @@ func TestFirstDeploymentRecoveryVerifiesAbsence(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	calls := 0
-	f.rt.test = func(context.Context) error {
+	f.rt.reload = func(context.Context) error {
 		calls++
 		if calls == 1 {
 			return os.ErrInvalid

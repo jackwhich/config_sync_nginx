@@ -76,7 +76,7 @@ func newFixture(t *testing.T) *fixture {
 	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.name", "Test")
 	gitRun(t, repo, "config", "user.email", "test@example.invalid")
-	cfg := config.Config{ListenAddr: "127.0.0.1:0", Env: "test", NodeID: "test-node", DataDir: filepath.Join(root, "state"), LockFile: filepath.Join(root, "node.lock"), ReleaseAuthTokens: map[string]string{"test": "secret"}, Repos: map[string]config.Repo{"config": {URL: "file://" + repo, AllowLocal: true, AllowedBranches: []string{"main"}}}, Targets: []config.Target{{Type: release.ReleaseTypeConfig, ServerName: "site", PathDest: filepath.Join(root, "deploy"), HealthChecks: []config.HealthCheck{{URL: "http://127.0.0.1/", Contains: "{commit}"}}, InitialHealthChecks: []config.HealthCheck{{URL: "http://127.0.0.1/", Status: 404}}}}, Nginx: config.Nginx{Binary: "/test/nginx", ConfigFile: "/test/nginx.conf", PIDFile: "/test/nginx.pid"}, StepTimeout: config.Duration(5 * time.Second), ExecutionTimeout: config.Duration(15 * time.Second), RecoveryTimeout: config.Duration(5 * time.Second)}
+	cfg := config.Config{ListenAddr: "127.0.0.1:0", Env: "test", NodeID: "test-node", DataDir: filepath.Join(root, "state"), LockFile: filepath.Join(root, "node.lock"), ReleaseAuthTokens: map[string]string{"test": "secret"}, Repos: map[string]config.Repo{"config": {URL: "file://" + repo, AllowLocal: true, AllowedBranches: []string{"main"}}}, Targets: []config.Target{{Type: release.ReleaseTypeConfig, ServerName: "site", PathDest: filepath.Join(root, "deploy"), HealthChecks: []config.HealthCheck{{URL: "http://127.0.0.1/", Contains: "{commit}"}}, InitialHealthChecks: []config.HealthCheck{{URL: "http://127.0.0.1/", Status: 404}}}}, StepTimeout: config.Duration(5 * time.Second), ExecutionTimeout: config.Duration(15 * time.Second), RecoveryTimeout: config.Duration(5 * time.Second)}
 	if e = cfg.Validate(); e != nil {
 		t.Fatal(e)
 	}
@@ -193,17 +193,17 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 		t.Fatalf("idempotency lost on restart: %+v", got)
 	}
 }
-func TestTestFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
+func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
 	b := f.commit("B")
 	before, _ := f.current()
 	calls := 0
-	f.rt.test = func(context.Context) error {
+	f.rt.reload = func(context.Context) error {
 		calls++
 		if calls == 1 {
-			return errors.New("syntax invalid")
+			return errors.New("reload command failed")
 		}
 		return nil
 	}
@@ -215,7 +215,7 @@ func TestTestFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	if st.Current.CommitID != a || link != "releases/"+a || st.Revision == before.Revision {
 		t.Fatal("baseline/revision not restored")
 	}
-	f.rt.test = nil
+	f.rt.reload = nil
 	res := f.apply(b)
 	if res.Status != release.NodeStatusSucceeded {
 		t.Fatal("retry incorrectly skipped")
@@ -228,7 +228,7 @@ func TestReloadSuccessWithoutActivationIsFailure(t *testing.T) {
 	b := f.commit("B")
 	f.rt.verify = func(_ context.Context, id string, _ bool) error {
 		if id == b {
-			return errors.New("old workers still serving")
+			return errors.New("configured HTTP probe returned old content")
 		}
 		return nil
 	}
@@ -248,7 +248,7 @@ func TestDisconnectedClientCannotCancelCriticalWorkAndNodeLock(t *testing.T) {
 	entered := make(chan struct{})
 	proceed := make(chan struct{})
 	var once sync.Once
-	f.rt.test = func(c context.Context) error { once.Do(func() { close(entered) }); <-proceed; return c.Err() }
+	f.rt.reload = func(c context.Context) error { once.Do(func() { close(entered) }); <-proceed; return c.Err() }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan release.Result, 1)
 	go func() { done <- f.r.Apply(ctx, req) }()
@@ -282,7 +282,7 @@ func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
 	a := f.commit("A")
 	f.apply(a)
 	b := f.commit("B")
-	f.rt.test = func(context.Context) error { return errors.New("nginx unavailable") }
+	f.rt.reload = func(context.Context) error { return errors.New("nginx unavailable") }
 	req := f.request(b)
 	got := f.r.Apply(context.Background(), req)
 	if got.Status != release.NodeStatusRecoveryRequired || got.HTTPStatus != 503 {
@@ -294,7 +294,7 @@ func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
 	if got = f.r.Apply(context.Background(), f.request(b)); got.HTTPStatus != 503 {
 		t.Fatalf("new work accepted: %+v", got)
 	}
-	f.rt.test = nil
+	f.rt.reload = nil
 	f.restart()
 	st, link := f.current()
 	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != a || link != "releases/"+a {

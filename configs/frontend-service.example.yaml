@@ -1,4 +1,4 @@
-# 仅前端的 HTTP 服务配置。UTF-8；复用本机已经运行的 Nginx。
+# 仅前端的 HTTP 文件发布配置。UTF-8；切换 latest 后执行 nginx -t，通过后 nginx -s reload。
 listen_addr: ":9166"
 env: uat
 data_dir: /data/nginx-updata-config/data
@@ -21,4 +21,4 @@ targets:
 # POST params: {server_name: app, path_dest: /var/www}
 # 前端落盘 /var/www/app/<完整 SHA>，latest 与 SHA 目录同级。
 # Nginx 已有 root 应指向 /var/www/app/latest。
-# 不用 Docker，不配置 CI 代理，不需要 nginx 路径块或逐站点 targets。
+# 不用 Docker；服务无需 nginx 路径块或逐站点 targets。

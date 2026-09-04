@@ -4,7 +4,7 @@ listen_addr: 127.0.0.1:8081
 node_id: nginx-uat-01
 env: uat
 data_dir: /var/lib/nginx-release
-# 同一台机器、同一 Nginx 实例的所有服务进程必须使用同一个锁文件和 data_dir。
+# 同一组部署目录的所有服务进程必须使用同一个锁文件和 data_dir。
 lock_file: /var/lock/nginx-release.lock
 log_file: ""  # JSON Lines 到 stdout；time/level/message，访问日志含 client_ip/status_code
 release_auth_tokens:
@@ -25,11 +25,6 @@ max_archive_files: 100000
 min_free_bytes: 67108864
 keep_releases: 5
 asset_retention: 168h
-nginx:
-  binary: /usr/sbin/nginx
-  config_file: /etc/nginx/nginx.conf
-  prefix: /etc/nginx
-  pid_file: /run/nginx.pid
 # 仅 frontend_static 目标需要 ORAS；登录凭据由运维使用 pull-only Robot 预置。
 oras:
   binary: /usr/local/bin/oras

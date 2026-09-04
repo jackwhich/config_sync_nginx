@@ -1,4 +1,4 @@
-# UTF-8。HTTP 发布服务；已有 Nginx 自动识别，不需要填写 nginx 配置块。
+# UTF-8。HTTP 文件发布服务；同步后执行已有 nginx -t，通过后 nginx -s reload。
 listen_addr: ":9166"
 # hostname 可省略，默认读取本机主机名；也兼容 node_id。
 # hostname: nginx-uat-01
@@ -37,6 +37,5 @@ targets:
 
 # 可选限制实际调用方 IP；留空时由环境 Token 认证。
 # allowed_client_ips: ["192.0.2.10"]
-# 单实例无需 nginx 块；多实例时仅指定已有实例的 pid_file 即可。
-# nginx:
-#   pid_file: /run/nginx-custom.pid
+# 服务不管理 Nginx 安装路径、主配置或进程；无需 nginx 配置块。
+# 确保服务进程的 PATH 中已有 nginx 命令及执行 -t 和 -s reload 所需权限。

@@ -66,5 +66,5 @@ func (r *Runner) claimTarget(t config.Target) error {
 		return e
 	}
 	defer base.Close()
-	return claim(base, ".publisher.json", owner{r.cfg.NodeID, r.cfg.Env, r.cfg.DataDir, r.cfg.LockFile})
+	return claim(base, ".publisher.json", owner{r.cfg.NodeID, t.Env, r.cfg.DataDir, r.cfg.LockFile})
 }

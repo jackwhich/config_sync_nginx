@@ -44,7 +44,16 @@ type Runner struct {
 	stopping  bool
 }
 
-func New(cfg config.Config) (*Runner, error) { return NewWithRuntime(cfg, &nginx.Runtime{Config: cfg}) }
+func New(cfg config.Config) (*Runner, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.StepTimeout.Value())
+	defer cancel()
+	resolved, err := nginx.Discover(ctx, cfg.Nginx)
+	if err != nil {
+		return nil, fmt.Errorf("discover running nginx: %w", err)
+	}
+	cfg.Nginx = resolved
+	return NewWithRuntime(cfg, &nginx.Runtime{Config: cfg})
+}
 func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 	store, e := statestore.Open(cfg.DataDir)
 	if e != nil {
@@ -56,9 +65,7 @@ func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 		return nil, e
 	}
 	r := &Runner{cfg: cfg, artifacts: oras.Client{Config: cfg.ORAS, DataDir: cfg.DataDir, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, git: git.Client{DataDir: cfg.DataDir, Repos: cfg.Repos, MaxBytes: cfg.MaxArchiveBytes, MaxFiles: cfg.MaxArchiveFiles}, runtime: rt, store: store, nodeLock: nl, busy: make(chan struct{}, 1), views: map[string]*state.TargetState{}}
-	for _, t := range cfg.Targets {
-		prom.InitTarget(cfg.Env, string(t.Type), t.ID)
-	}
+
 	if e = nl.Try(); e != nil {
 		r.Close()
 		return nil, fmt.Errorf("startup requires idle node lock: %w", e)
@@ -68,42 +75,27 @@ func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 		r.Close()
 		return nil, e
 	}
+	startupTargets := map[string]config.Target{}
 	for _, t := range cfg.Targets {
-		if e := r.claimTarget(t); e != nil {
-			r.Close()
-			return nil, e
+		if !t.IsTemplate() {
+			startupTargets[t.ID] = t
 		}
-		st, e := store.Load(t.ID)
-		if statestore.IsMissing(e) {
-			st = state.New(t)
-			base, err := openTarget(t)
-			if err != nil {
-				r.Close()
-				return nil, err
-			}
-			entries, err := fs.ReadDir(base.FS(), ".")
-			base.Close()
-			if err != nil {
-				r.Close()
-				return nil, err
-			}
-			// Existing unmanaged files must be explicitly migrated, never silently adopted.
-			for _, entry := range entries {
-				if entry.Name() != ".publisher.json" {
-					st.RecoveryRequired = true
-				}
-			}
-			if e = r.save(st); e != nil {
-				r.Close()
-				return nil, e
-			}
-		} else if e != nil {
-			r.Close()
-			return nil, e
+	}
+	for _, st := range r.views {
+		env := st.Target.Env
+		if env == "" {
+			env = cfg.Env
 		}
-		if st.Target.Dir != t.Dir {
+		t, err := cfg.TargetForEnv(st.Target.Type, st.Target.ServerName, st.Target.PathDest, st.Target.Project, env)
+		if err == nil && t.ID == st.Target.ID {
+			startupTargets[t.ID] = t
+		}
+	}
+	for _, t := range startupTargets {
+		st, err := r.ensureTarget(t)
+		if err != nil {
 			r.Close()
-			return nil, fmt.Errorf("state target directory mismatch")
+			return nil, err
 		}
 		if st.ActiveID != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.RecoveryTimeout.Value())
@@ -113,11 +105,7 @@ func NewWithRuntime(cfg config.Config, rt Runtime) (*Runner, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.StepTimeout.Value())
 			err := r.checkStoredBaseline(ctx, t, st)
 			cancel()
-			if err != nil {
-				st.RecoveryRequired = true
-			} else {
-				st.RecoveryRequired = false
-			}
+			st.RecoveryRequired = err != nil
 			if err := r.save(st); err != nil {
 				r.block(err.Error())
 			}
@@ -156,12 +144,16 @@ func (r *Runner) Wait(ctx context.Context) error {
 	}
 }
 func (r *Runner) configured(id string) bool {
-	for _, t := range r.cfg.Targets {
-		if t.ID == id {
-			return true
-		}
+	st := r.views[id]
+	if st == nil {
+		return false
 	}
-	return false
+	env := st.Target.Env
+	if env == "" {
+		env = r.cfg.Env
+	}
+	t, err := r.cfg.TargetForEnv(st.Target.Type, st.Target.ServerName, st.Target.PathDest, st.Target.Project, env)
+	return err == nil && t.ID == id
 }
 func (r *Runner) block(reason string) { r.mu.Lock(); r.blocked = reason; r.mu.Unlock() }
 func clone(st *state.TargetState) *state.TargetState {
@@ -178,8 +170,8 @@ func (r *Runner) publish(st *state.TargetState) {
 }
 func (r *Runner) save(st *state.TargetState) error {
 	if e := r.store.Save(st); e != nil {
-		prom.PersistFailure(r.cfg.Env, string(st.Target.Type), st.Target.ID)
-		applog.LogError("发布状态写入失败", "state_persist_failed", map[string]any{"env": r.cfg.Env, "target_id": st.Target.ID, "error": e.Error()})
+		prom.PersistFailure(st.Target.Env, string(st.Target.Type), st.Target.ID)
+		applog.LogError("发布状态写入失败", "state_persist_failed", map[string]any{"env": st.Target.Env, "target_id": st.Target.ID, "error": e.Error()})
 		return e
 	}
 	r.publish(st)
@@ -216,7 +208,7 @@ func (r *Runner) Health() map[string]any {
 		if st.Current != nil {
 			verifiedAt = st.Current.VerifiedAt
 		}
-		prom.TargetState(r.cfg.Env, string(st.Target.Type), st.Target.ID, st.RecoveryRequired, verifiedAt)
+		prom.TargetState(st.Target.Env, string(st.Target.Type), st.Target.ID, st.RecoveryRequired, verifiedAt)
 		if st.RecoveryRequired {
 			ready = false
 			if reason == "" {
@@ -225,18 +217,113 @@ func (r *Runner) Health() map[string]any {
 		}
 	}
 	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
-	return map[string]any{"status": "ok", "release_contract": 2, "capabilities": []string{release.FrontendORASCapability}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
-}
-func (r *Runner) Target(id string) (config.Target, bool) {
-	for _, t := range r.cfg.Targets {
-		if t.ID == id {
-			return t, true
+	envs := []string{}
+	for env := range r.cfg.ReleaseAuthTokens {
+		if r.cfg.AcceptsEnv(env) {
+			envs = append(envs, env)
 		}
 	}
-	return config.Target{}, false
+	return map[string]any{"enabled_envs": envs, "status": "ok", "release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1"}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "publish_ready": ready, "busy": len(r.busy) > 0, "reason": reason}
 }
-func (r *Runner) Resolve(typ release.ReleaseType, site, root, project string) (config.Target, error) {
-	return r.cfg.Target(typ, site, root, project)
+func (r *Runner) Target(id string) (config.Target, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	st := r.views[id]
+	if st == nil {
+		return config.Target{}, false
+	}
+	env := st.Target.Env
+	if env == "" {
+		env = r.cfg.Env
+	}
+	t, err := r.cfg.TargetForEnv(st.Target.Type, st.Target.ServerName, st.Target.PathDest, st.Target.Project, env)
+	return t, err == nil && t.ID == id
+}
+func (r *Runner) Resolve(typ release.ReleaseType, site, root, project string, environments ...string) (config.Target, error) {
+	env := r.cfg.Env
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	t, err := r.cfg.TargetForEnv(typ, site, root, project, env)
+	if err != nil {
+		return config.Target{}, err
+	}
+	if existing, ok := r.Target(t.ID); ok {
+		return existing, nil
+	}
+	select {
+	case r.busy <- struct{}{}:
+		defer func() { <-r.busy }()
+	default:
+		return config.Target{}, lock.ErrBusy
+	}
+	if err := r.nodeLock.Try(); err != nil {
+		return config.Target{}, err
+	}
+	defer r.nodeLock.Unlock()
+	if err := r.load(); err != nil {
+		return config.Target{}, err
+	}
+	if _, err := r.ensureTarget(t); err != nil {
+		return config.Target{}, err
+	}
+	return t, nil
+}
+
+// Called only with the node lock; registered targets survive service restarts.
+func (r *Runner) ensureTarget(t config.Target) (*state.TargetState, error) {
+	r.mu.RLock()
+	count := len(r.views)
+	var conflict bool
+	for id, other := range r.views {
+		if id != t.ID && (fsutil.Within(t.Dir, other.Target.Dir) || fsutil.Within(other.Target.Dir, t.Dir)) {
+			conflict = true
+		}
+	}
+	r.mu.RUnlock()
+	if conflict {
+		return nil, fmt.Errorf("deployment directory overlaps a registered target")
+	}
+	st, err := r.store.Load(t.ID)
+	if err != nil && !statestore.IsMissing(err) {
+		return nil, err
+	}
+	if statestore.IsMissing(err) {
+		if count >= r.cfg.MaxDynamicTargets && t.Dynamic {
+			return nil, fmt.Errorf("registered target limit reached")
+		}
+		st = state.New(t)
+		if err := r.claimTarget(t); err != nil {
+			return nil, err
+		}
+		base, err := openTarget(t)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := fs.ReadDir(base.FS(), ".")
+		base.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.Name() != ".publisher.json" {
+				st.RecoveryRequired = true
+			}
+		}
+	} else {
+		if st.Target.Dir != t.Dir || st.Target.Type != t.Type {
+			return nil, fmt.Errorf("state target mismatch")
+		}
+		if err := r.claimTarget(t); err != nil {
+			return nil, err
+		}
+		st.Target = t
+	}
+	if err := r.save(st); err != nil {
+		return nil, err
+	}
+	prom.InitTarget(t.Env, string(t.Type), t.ID)
+	return st, nil
 }
 
 // State includes the live revision independently of a historical release result.
@@ -256,7 +343,7 @@ func (r *Runner) State(id, releaseID string) (map[string]any, int, error) {
 		}
 	}
 	r.mu.RUnlock()
-	out := map[string]any{"release_contract": 2, "capabilities": []string{release.FrontendORASCapability}, "node_id": r.cfg.NodeID, "env": r.cfg.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
+	out := map[string]any{"release_contract": 2, "capabilities": []string{release.FrontendORASCapability, "request_targets_v1"}, "node_id": r.cfg.NodeID, "env": t.Env, "target": t, "target_id": id, "state_revision": st.Revision, "current": st.Current, "previous": st.Previous, "active_release_id": st.ActiveID, "recovery_required": st.RecoveryRequired, "current_commit_id": "", "previous_commit_id": ""}
 	if st.Current != nil {
 		out["current_commit_id"] = st.Current.CommitID
 	}
@@ -316,11 +403,21 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	if e := release.ValidateApplyRequest(&req); e != nil {
 		return reject(req, 400, "INVALID_REQUEST", e.Error())
 	}
-	if req.Env != r.cfg.Env {
+	if !r.cfg.AcceptsEnv(req.Env) {
 		return reject(req, 403, "ENV_NOT_ALLOWED", "environment does not match this node")
 	}
-	t, e := r.Resolve(req.Type, release.ServerIdentity(req.Params), req.Params["path_dest"], req.Project)
+	if req.DataDir != "" {
+		path, err := fsutil.Canonical(req.DataDir)
+		if err != nil || path != r.cfg.DataDir {
+			return reject(req, 400, "INVALID_DATA_DIR", "data_dir must match the service configuration")
+		}
+		req.DataDir = ""
+	}
+	t, e := r.Resolve(req.Type, release.ServerIdentity(req.Params), req.Params["path_dest"], req.Project, req.Env)
 	if e != nil {
+		if errors.Is(e, lock.ErrBusy) {
+			return reject(req, 409, "NODE_BUSY", e.Error())
+		}
 		return reject(req, 403, "TARGET_NOT_ALLOWED", e.Error())
 	}
 	req.Params["path_dest"] = t.PathDest
@@ -372,7 +469,7 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	if e != nil {
 		return reject(req, 503, "STATE_UNAVAILABLE", e.Error())
 	}
-	if req.ExpectedStateRevision != st.Revision {
+	if req.ExpectedStateRevision != "" && req.ExpectedStateRevision != st.Revision {
 		return reject(req, 409, "STATE_REVISION_CONFLICT", "target revision has changed; query live state")
 	}
 	if req.RestoreOf != "" {
@@ -381,11 +478,14 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 			return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "restore requires the successful release's retained baseline and unchanged resulting revision")
 		}
 	}
+	if req.RestoreOf != "" && req.Type == release.ReleaseTypeFrontendStatic && req.ArtifactDigest == "" {
+		req.ArtifactDigest = st.Records[req.RestoreOf].Baseline.ArtifactDigest
+	}
 	if req.RestoreOf != "" && req.Type == release.ReleaseTypeFrontendStatic && st.Records[req.RestoreOf].Baseline.ArtifactDigest != req.ArtifactDigest {
 		return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "artifact digest must match the recorded local baseline")
 	}
-	prom.Active(r.cfg.Env, string(t.Type), t.ID, true)
-	defer prom.Active(r.cfg.Env, string(t.Type), t.ID, false)
+	prom.Active(t.Env, string(t.Type), t.ID, true)
+	defer prom.Active(t.Env, string(t.Type), t.ID, false)
 	rec := &state.Record{Request: req, Fingerprint: fingerprint, Baseline: st.Current, BaselinePrevious: st.Previous, HTTPStatus: 409}
 	rec.Result = release.Result{ArtifactDigest: req.ArtifactDigest, ReleaseID: req.ReleaseID, TargetID: t.ID, Env: req.Env, Type: req.Type, Project: req.Project, ServerName: t.ServerName, Version: req.Version, CommitID: req.CommitID, Status: release.NodeStatusRunning, Phase: "accepted", ActivationStatus: "unchanged", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}
 	if st.Current != nil {
@@ -453,6 +553,26 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 			var err error
 			if req.Type == release.ReleaseTypeFrontendStatic {
 				actual = req.CommitID
+				if req.ArtifactDigest == "" {
+					resolver, ok := r.artifacts.(interface {
+						Resolve(context.Context, config.Target, string) (string, error)
+					})
+					if !ok {
+						return fmt.Errorf("artifact source does not support SHA tag resolution")
+					}
+					req.ArtifactDigest, err = resolver.Resolve(c, t, req.CommitID)
+					if err != nil {
+						return err
+					}
+					if !release.IsArtifactDigest(req.ArtifactDigest) {
+						return fmt.Errorf("invalid resolved artifact digest")
+					}
+					source = r.source(req, t)
+					rec.Result.ArtifactDigest = req.ArtifactDigest
+					if err := r.save(st); err != nil {
+						return err
+					}
+				}
 				work, err = r.artifacts.Pull(c, t, req.CommitID, req.ArtifactDigest)
 			} else {
 				work, actual, err = r.git.Checkout(c, req.SourceRepo, req.Branch, req.CommitID, t.ServerName)
@@ -541,8 +661,8 @@ func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Rec
 		message = err.Error()
 	}
 	rec.Result.Steps = append(rec.Result.Steps, release.Step{Name: name, Status: status, Message: message, StartedAt: started.UTC(), DurationMS: time.Since(started).Milliseconds()})
-	prom.Step(r.cfg.Env, string(st.Target.Type), st.Target.ID, name, string(status), time.Since(started))
-	fields := map[string]any{"env": r.cfg.Env, "node_id": r.cfg.NodeID, "release_id": rec.Request.ReleaseID, "target_id": st.Target.ID, "step": name, "status": status, "duration_ms": time.Since(started).Milliseconds()}
+	prom.Step(st.Target.Env, string(st.Target.Type), st.Target.ID, name, string(status), time.Since(started))
+	fields := map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "release_id": rec.Request.ReleaseID, "target_id": st.Target.ID, "step": name, "status": status, "duration_ms": time.Since(started).Milliseconds()}
 	if err != nil {
 		fields["error"] = message
 		applog.LogError("发布步骤失败", "release_step", fields)
@@ -565,7 +685,7 @@ func (r *Runner) verify(ctx context.Context, t config.Target, base *os.Root, v *
 	if e = r.runtime.Verify(ctx, t, commit, v == nil); e != nil {
 		return e
 	}
-	if t.Type == release.ReleaseTypeFrontendStatic && v != nil {
+	if t.Type == release.ReleaseTypeFrontendStatic && v != nil && t.PublicBaseURL != "" {
 		return nginx.VerifyFrontendHTTP(ctx, t, m)
 	}
 	return nil
@@ -574,9 +694,9 @@ func (r *Runner) result(rec *state.Record) release.Result {
 	result := rec.Result
 	result.HTTPStatus = rec.HTTPStatus
 	if result.Terminal() {
-		prom.Terminal(r.cfg.Env, string(result.Type), result.TargetID, string(result.Status))
+		prom.Terminal(result.Env, string(result.Type), result.TargetID, string(result.Status))
 	}
-	fields := map[string]any{"env": r.cfg.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
+	fields := map[string]any{"env": result.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
 	if result.ArtifactDigest != "" {
 		fields["artifact_digest"] = result.ArtifactDigest
 	}
@@ -647,7 +767,7 @@ func (r *Runner) commit(t config.Target, st *state.TargetState, rec *state.Recor
 	e := cleanupSnapshots(cleanup, r.cfg, t, st)
 	cancel()
 	if e != nil {
-		prom.CleanupFailure(r.cfg.Env, string(t.Type), t.ID)
+		prom.CleanupFailure(t.Env, string(t.Type), t.ID)
 		applog.LogWarn("历史快照清理失败", "cleanup_warning", map[string]any{"release_id": rec.Request.ReleaseID, "target_id": t.ID, "error": e.Error()})
 		rec.Result.Warnings = append(rec.Result.Warnings, "cleanup: "+e.Error())
 		if e = r.save(st); e != nil {
@@ -658,7 +778,7 @@ func (r *Runner) commit(t config.Target, st *state.TargetState, rec *state.Recor
 }
 func (r *Runner) restore(t config.Target, st *state.TargetState, rec *state.Record, key string, cause error) release.Result {
 	outcome := "failed"
-	defer func() { prom.Rollback(r.cfg.Env, string(t.Type), t.ID, outcome) }()
+	defer func() { prom.Rollback(t.Env, string(t.Type), t.ID, outcome) }()
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.RecoveryTimeout.Value())
 	defer cancel()
 	base, e := openTarget(t)
@@ -791,7 +911,7 @@ func (r *Runner) cleanupExport(t config.Target, work string) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CleanupTimeout.Value())
 	defer cancel()
 	if e = fsutil.RemoveTree(ctx, root, filepath.Base(work)); e != nil {
-		prom.CleanupFailure(r.cfg.Env, string(t.Type), t.ID)
+		prom.CleanupFailure(t.Env, string(t.Type), t.ID)
 		applog.LogWarn("导出临时目录清理未完成", "cleanup_warning", map[string]any{"target_id": t.ID, "error": e.Error()})
 	}
 }

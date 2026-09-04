@@ -22,10 +22,32 @@ import (
 // latest -> <full-commit> link whose complete contents match the configured Git source.
 // Its durable intent is recovered by the normal HTTP service after an interruption.
 func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, commit string) error {
+	if !release.ValidTargetID(targetID) || !release.IsCommit(commit) {
+		return fmt.Errorf("target_id and full commit required")
+	}
 	var target config.Target
 	for _, t := range cfg.Targets {
 		if t.ID == targetID {
 			target = t
+		}
+	}
+	if target.ID == "" {
+		store, err := statestore.Open(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		registered, err := store.Load(targetID)
+		store.Close()
+		if err != nil {
+			return fmt.Errorf("query this target's state once to register its HTTP params before offline adoption: %w", err)
+		}
+		env := registered.Target.Env
+		if env == "" {
+			env = cfg.Env
+		}
+		target, err = cfg.TargetForEnv(registered.Target.Type, registered.Target.ServerName, registered.Target.PathDest, registered.Target.Project, env)
+		if err != nil || target.ID != targetID {
+			return fmt.Errorf("registered target is not enabled")
 		}
 	}
 	if target.ID == "" || !release.IsCommit(commit) {
@@ -34,6 +56,11 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if target.Type == release.ReleaseTypeFrontendStatic {
 		return fmt.Errorf("frontend ORAS migration requires a new empty target and explicit Nginx root cutover; old Git snapshots are not adopted")
 	}
+	resolved, err := nginx.Discover(ctx, cfg.Nginx)
+	if err != nil {
+		return err
+	}
+	cfg.Nginx = resolved
 	nl, e := lock.Open(cfg.LockFile)
 	if e != nil {
 		return e
@@ -62,7 +89,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 		return e
 	}
 	defer base.Close()
-	if e = claim(base, ".publisher.json", owner{cfg.NodeID, cfg.Env, cfg.DataDir, cfg.LockFile}); e != nil {
+	if e = claim(base, ".publisher.json", owner{cfg.NodeID, target.Env, cfg.DataDir, cfg.LockFile}); e != nil {
 		return e
 	}
 	oldLink, e := fsutil.Link(base)
@@ -131,11 +158,11 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	// The legacy files are identical. A local baseline under releases/ is now valid.
 	// Persist an ordinary switch intent before touching latest, so startup can finish it.
 	id := release.ID()
-	req := release.ApplyRequest{ReleaseID: id, ExpectedStateRevision: st.Revision, Env: cfg.Env, Type: target.Type, SourceRepo: string(target.Type), Branch: branch, CommitID: commit, Version: commit, Project: target.Project, Params: map[string]string{"path_dest": target.PathDest, "server_name": target.ServerName}}
+	req := release.ApplyRequest{ReleaseID: id, ExpectedStateRevision: st.Revision, Env: target.Env, Type: target.Type, SourceRepo: string(target.Type), Branch: branch, CommitID: commit, Version: commit, Project: target.Project, Params: map[string]string{"path_dest": target.PathDest, "server_name": target.ServerName}}
 	rec := &state.Record{Request: req, Fingerprint: release.Digest(struct {
 		Request      release.ApplyRequest
 		Target, Repo string
-	}{req, target.ID, cfg.Repos[string(target.Type)].URL}), Candidate: candidate, Baseline: candidate, BeforeLink: candidate.Link, Intent: true, HTTPStatus: 409, Result: release.Result{ReleaseID: id, TargetID: target.ID, Env: cfg.Env, Type: target.Type, Project: target.Project, ServerName: target.ServerName, Version: commit, CommitID: commit, Status: release.NodeStatusRunning, Phase: "baseline_migration", ActivationStatus: "unknown", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}}
+	}{req, target.ID, cfg.Repos[string(target.Type)].URL}), Candidate: candidate, Baseline: candidate, BeforeLink: candidate.Link, Intent: true, HTTPStatus: 409, Result: release.Result{ReleaseID: id, TargetID: target.ID, Env: target.Env, Type: target.Type, Project: target.Project, ServerName: target.ServerName, Version: commit, CommitID: commit, Status: release.NodeStatusRunning, Phase: "baseline_migration", ActivationStatus: "unknown", RollbackStatus: "not_needed", StateRevisionBefore: st.Revision, StateRevisionAfter: st.Revision, StartedAt: time.Now().UTC()}}
 	st.ActiveID = id
 	st.RecoveryRequired = true
 	st.Records[id] = rec

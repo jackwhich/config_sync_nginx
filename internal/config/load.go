@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,19 +35,26 @@ type Repo struct {
 type HealthCheck = target.HealthCheck
 
 type Nginx struct {
-	Binary     string `yaml:"binary"`
-	ConfigFile string `yaml:"config_file"`
-	Prefix     string `yaml:"prefix"`
-	PIDFile    string `yaml:"pid_file"`
+	MasterPID        int    `yaml:"-"`
+	GlobalDirectives string `yaml:"-"`
+	ErrorLog         string `yaml:"-"`
+	Binary           string `yaml:"binary"`
+	ConfigFile       string `yaml:"config_file"`
+	Prefix           string `yaml:"prefix"`
+	PIDFile          string `yaml:"pid_file"`
 }
 type Target = target.Target
 
 type ORAS struct {
+	Repository     string `yaml:"repository"`
 	Binary         string `yaml:"binary"`
 	RegistryConfig string `yaml:"registry_config"`
 	CAFile         string `yaml:"ca_file"`
 }
 type Config struct {
+	Hostname              string            `yaml:"hostname"`
+	App                   string            `yaml:"app"`
+	MaxDynamicTargets     int               `yaml:"max_dynamic_targets"`
 	ORAS                  ORAS              `yaml:"oras"`
 	ListenAddr            string            `yaml:"listen_addr"`
 	NodeID                string            `yaml:"node_id"`
@@ -85,16 +93,54 @@ func Load(p string) (Config, error) {
 	if e = dec.Decode(&c); e != nil {
 		return c, e
 	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return c, fmt.Errorf("configuration must contain exactly one YAML document")
+	}
 	return c, c.Validate()
 }
 func (c *Config) Validate() error {
-	if c.ListenAddr == "" || c.Env == "" || c.NodeID == "" {
-		return fmt.Errorf("listen_addr, env, node_id are required")
+	if c.ListenAddr == "" {
+		c.ListenAddr = ":9166"
+	}
+	if c.NodeID != "" && c.Hostname != "" && c.NodeID != c.Hostname {
+		return fmt.Errorf("hostname and node_id disagree")
+	}
+	if c.NodeID == "" {
+		c.NodeID = c.Hostname
+	}
+	if c.NodeID == "" {
+		c.NodeID, _ = os.Hostname()
+	}
+	if c.NodeID == "" {
+		return fmt.Errorf("cannot determine node hostname")
+	}
+	if len(c.ReleaseAuthTokens) == 0 {
+		return fmt.Errorf("release_auth_tokens is required")
+	}
+	for env, token := range c.ReleaseAuthTokens {
+		if strings.TrimSpace(env) != env || env == "" || len(env) > 64 || strings.TrimSpace(token) == "" {
+			return fmt.Errorf("invalid release_auth_tokens environment or empty token")
+		}
+	}
+	if c.Env == "" && len(c.ReleaseAuthTokens) == 1 {
+		for env := range c.ReleaseAuthTokens {
+			c.Env = env
+		}
+	}
+	if c.LockFile == "" {
+		c.LockFile = filepath.Join(c.DataDir, "publish.lock")
+	}
+	if c.MaxDynamicTargets == 0 {
+		c.MaxDynamicTargets = 1000
+	}
+	if c.MaxDynamicTargets < 1 {
+		return fmt.Errorf("max_dynamic_targets must be positive")
 	}
 	if len(c.NodeID) > 128 || len(c.Env) > 64 {
 		return fmt.Errorf("node_id/env too long")
 	}
-	if strings.TrimSpace(c.ReleaseAuthTokens[c.Env]) == "" {
+	if c.Env != "" && strings.TrimSpace(c.ReleaseAuthTokens[c.Env]) == "" {
 		return fmt.Errorf("release_auth_tokens must include current env")
 	}
 	if !filepath.IsAbs(c.DataDir) || !filepath.IsAbs(c.LockFile) {
@@ -148,14 +194,30 @@ func (c *Config) Validate() error {
 	if c.MaxRequestBytes < 1 || c.MaxConcurrentRequests < 1 || c.MaxArchiveBytes < 1 || c.MaxArchiveFiles < 1 || c.KeepReleases < 2 {
 		return fmt.Errorf("invalid resource limits")
 	}
+	if c.Targets == nil {
+		for _, typ := range []release.ReleaseType{release.ReleaseTypeConfig, release.ReleaseTypeWhitelist} {
+			if _, ok := c.Repos[string(typ)]; ok {
+				c.Targets = append(c.Targets, Target{Type: typ})
+			}
+		}
+		if c.ORAS.Repository != "" {
+			c.Targets = append(c.Targets, Target{Type: release.ReleaseTypeFrontendStatic})
+		}
+	}
 	if len(c.Targets) == 0 {
-		return fmt.Errorf("at least one explicit target is required")
+		return fmt.Errorf("targets or a configured release repository is required")
 	}
 	seen := map[string]bool{}
 	needNginx := false
 	for i := range c.Targets {
 		t := &c.Targets[i]
-		if e = release.ValidateRepoSiteDirectoryName(t.ServerName); e != nil {
+		t.Env = c.Env
+		if t.IsTemplate() {
+			if seen["type:"+string(t.Type)] {
+				return fmt.Errorf("duplicate target type")
+			}
+			seen["type:"+string(t.Type)] = true
+		} else if e = release.ValidateRepoSiteDirectoryName(t.ServerName); e != nil {
 			return e
 		}
 		switch t.Type {
@@ -163,7 +225,11 @@ func (c *Config) Validate() error {
 			needNginx = true
 		case release.ReleaseTypeFrontendStatic:
 			needNginx = true
-			if e := ValidateArtifactRepository(t.ArtifactRepository); e != nil {
+			repository := t.ArtifactRepository
+			if repository == "" {
+				repository = c.ORAS.Repository
+			}
+			if e := ValidateArtifactRepository(strings.ReplaceAll(repository, "{server_name}", "site")); e != nil {
 				return e
 			}
 			if !filepath.IsAbs(c.ORAS.Binary) || !filepath.IsAbs(c.ORAS.RegistryConfig) {
@@ -175,33 +241,26 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("unsupported target type")
 		}
-		t.PathDest, e = fsutil.Canonical(t.PathDest)
-		if e != nil {
-			return e
-		}
-		if t.PathDest == string(os.PathSeparator) {
-			return fmt.Errorf("path_dest may not be filesystem root")
-		}
-		t.Dir = filepath.Join(t.PathDest, string(t.Type), t.ServerName)
-		if t.Type == release.ReleaseTypeFrontendStatic {
-			t.Dir = filepath.Join(t.PathDest, t.ServerName)
-		}
-		if fsutil.Within(t.Dir, c.LockFile) {
-			return fmt.Errorf("lock_file cannot reside within a deployment target")
-		}
-		if fsutil.Within(c.DataDir, t.Dir) || fsutil.Within(t.Dir, c.DataDir) {
-			return fmt.Errorf("deployment directory overlaps data_dir")
-		}
-		for _, other := range c.Targets[:i] {
-			if fsutil.Within(t.Dir, other.Dir) || fsutil.Within(other.Dir, t.Dir) {
-				return fmt.Errorf("overlapping targets")
+		if !t.IsTemplate() {
+			if c.Env == "" {
+				return fmt.Errorf("explicit site targets require env; use type-only targets for multiple environments")
 			}
+			if err := c.resolvePaths(t, c.Env); err != nil {
+				return err
+			}
+			if t.Type == release.ReleaseTypeFrontendStatic && t.ArtifactRepository == "" {
+				t.ArtifactRepository = strings.ReplaceAll(c.ORAS.Repository, "{server_name}", t.ServerName)
+			}
+			for _, other := range c.Targets[:i] {
+				if !other.IsTemplate() && (fsutil.Within(t.Dir, other.Dir) || fsutil.Within(other.Dir, t.Dir)) {
+					return fmt.Errorf("overlapping targets")
+				}
+			}
+			if seen[t.ID] {
+				return fmt.Errorf("duplicate target")
+			}
+			seen[t.ID] = true
 		}
-		t.ID = release.Digest([]string{c.Env, t.Dir})
-		if seen[t.ID] {
-			return fmt.Errorf("duplicate target")
-		}
-		seen[t.ID] = true
 		if t.FileMode == "" {
 			t.FileMode = "0644"
 		}
@@ -225,11 +284,9 @@ func (c *Config) Validate() error {
 			} else if u.Scheme != "https" || u.Host == "" || repo.GitLabToken == "" {
 				return fmt.Errorf("repository requires https URL and gitlab_token")
 			}
-			if len(repo.AllowedBranches) == 0 {
-				return fmt.Errorf("allowed_branches required for %s", t.Type)
-			}
+
 		}
-		if len(t.HealthChecks) == 0 {
+		if !t.IsTemplate() && len(t.HealthChecks) == 0 {
 			return fmt.Errorf("health_checks required for target %s", t.ServerName)
 		}
 		for j := range t.HealthChecks {
@@ -250,9 +307,14 @@ func (c *Config) Validate() error {
 			if t.SharedAssets && c.AssetRetention <= 0 {
 				return fmt.Errorf("frontend requires positive asset_retention")
 			}
-			u, err := url.Parse(t.PublicBaseURL)
-			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-				return fmt.Errorf("frontend requires public_base_url")
+			if t.IsTemplate() && t.SharedAssets && t.PublicBaseURL == "" {
+				return fmt.Errorf("shared_assets requires public_base_url")
+			}
+			if !t.IsTemplate() || t.PublicBaseURL != "" {
+				u, err := url.Parse(t.PublicBaseURL)
+				if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+					return fmt.Errorf("frontend requires public_base_url")
+				}
 			}
 		}
 		for _, f := range t.RequiredFiles {
@@ -262,8 +324,10 @@ func (c *Config) Validate() error {
 		}
 	}
 	if needNginx {
-		if !filepath.IsAbs(c.Nginx.Binary) || !filepath.IsAbs(c.Nginx.ConfigFile) || !filepath.IsAbs(c.Nginx.PIDFile) {
-			return fmt.Errorf("nginx binary, config_file and pid_file must be explicit absolute paths")
+		for _, path := range []string{c.Nginx.Binary, c.Nginx.ConfigFile, c.Nginx.PIDFile} {
+			if path != "" && !filepath.IsAbs(path) {
+				return fmt.Errorf("optional nginx paths must be absolute")
+			}
 		}
 		if c.Nginx.Prefix != "" && !filepath.IsAbs(c.Nginx.Prefix) {
 			return fmt.Errorf("nginx prefix must be absolute")
@@ -285,20 +349,76 @@ func validateCheck(h *HealthCheck) error {
 	}
 	return nil
 }
+func (c Config) AcceptsEnv(env string) bool {
+	return env != "" && strings.TrimSpace(c.ReleaseAuthTokens[env]) != "" && (c.Env == "" || c.Env == env)
+}
+func (c Config) resolvePaths(t *Target, env string) error {
+	var err error
+	t.PathDest, err = fsutil.Canonical(t.PathDest)
+	if err != nil {
+		return err
+	}
+	if t.PathDest == string(os.PathSeparator) {
+		return fmt.Errorf("path_dest may not be filesystem root")
+	}
+	t.Dir = filepath.Join(t.PathDest, string(t.Type), t.ServerName)
+	if t.Type == release.ReleaseTypeFrontendStatic {
+		t.Dir = filepath.Join(t.PathDest, t.ServerName)
+	}
+	if fsutil.Within(t.Dir, c.LockFile) || fsutil.Within(c.DataDir, t.Dir) || fsutil.Within(t.Dir, c.DataDir) {
+		return fmt.Errorf("deployment directory overlaps service state or lock")
+	}
+	t.Env = env
+	t.ID = release.Digest([]string{env, t.Dir})
+	return nil
+}
 func (c Config) Target(typ release.ReleaseType, site, root, project string) (Target, error) {
-	real, e := fsutil.Canonical(root)
-	if e != nil {
-		return Target{}, e
+	return c.TargetForEnv(typ, site, root, project, c.Env)
+}
+func (c Config) TargetForEnv(typ release.ReleaseType, site, root, project, env string) (Target, error) {
+	if !c.AcceptsEnv(env) {
+		return Target{}, fmt.Errorf("environment not enabled")
+	}
+	if err := release.ValidateRepoSiteDirectoryName(site); err != nil {
+		return Target{}, err
+	}
+	real, err := fsutil.Canonical(root)
+	if err != nil {
+		return Target{}, err
 	}
 	for _, t := range c.Targets {
-		if t.Type == typ && t.ServerName == site && t.PathDest == real {
+		if !t.IsTemplate() && t.Type == typ && t.ServerName == site && t.PathDest == real {
 			if t.Project != "" && project != "" && project != t.Project {
 				return Target{}, fmt.Errorf("project not authorized")
 			}
 			return t, nil
 		}
 	}
-	return Target{}, fmt.Errorf("target or deployment path not authorized")
+	for _, t := range c.Targets {
+		if t.IsTemplate() && t.Type == typ {
+			t.ServerName, t.PathDest, t.Project, t.Dynamic = site, real, project, true
+			if t.Type == release.ReleaseTypeFrontendStatic {
+				repository := t.ArtifactRepository
+				if repository == "" {
+					repository = c.ORAS.Repository
+				}
+				t.ArtifactRepository = strings.ReplaceAll(repository, "{server_name}", site)
+				if err := ValidateArtifactRepository(t.ArtifactRepository); err != nil {
+					return Target{}, err
+				}
+			}
+			if err := c.resolvePaths(&t, env); err != nil {
+				return Target{}, err
+			}
+			for _, other := range c.Targets {
+				if !other.IsTemplate() && (fsutil.Within(t.Dir, other.Dir) || fsutil.Within(other.Dir, t.Dir)) {
+					return Target{}, fmt.Errorf("overlaps configured site")
+				}
+			}
+			return t, nil
+		}
+	}
+	return Target{}, fmt.Errorf("release type or target not enabled")
 }
 
 // Repository allowlist comes from node configuration, never an HTTP supplied URL.

@@ -11,6 +11,10 @@ import (
 var ErrInvalidRequest = errors.New("请求无效")
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+var artifactDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+func IsArtifactDigest(s string) bool { return artifactDigestPattern.MatchString(s) }
+
 var sitePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 func IsID(v string) bool     { return uuidPattern.MatchString(v) }
@@ -21,14 +25,22 @@ func ValidateApplyRequest(r *ApplyRequest) error {
 	r.Project = strings.TrimSpace(r.Project)
 	r.CommitID = strings.ToLower(strings.TrimSpace(r.CommitID))
 	r.Version = strings.TrimSpace(r.Version)
+	r.ArtifactDigest = strings.TrimSpace(r.ArtifactDigest)
 	if !IsID(r.ReleaseID) || !IsID(r.ExpectedStateRevision) {
 		return fieldError("release_id/expected_state_revision", "须为 UUID，要求 HTTP 发布协议 2")
 	}
 	if r.RestoreOf != "" && !IsID(r.RestoreOf) {
 		return fieldError("restore_of", "须为 UUID")
 	}
-	if r.Env == "" || len(r.Env) > 64 || r.Branch == "" || len(r.Branch) > 255 {
+	if r.Env == "" || len(r.Env) > 64 || (r.Type != ReleaseTypeFrontendStatic && r.Branch == "") || len(r.Branch) > 255 {
 		return fieldError("env/branch", "不能为空或超长")
+	}
+	if r.Type == ReleaseTypeFrontendStatic {
+		if !IsArtifactDigest(r.ArtifactDigest) {
+			return fieldError("artifact_digest", "前端须指定 sha256 OCI manifest digest")
+		}
+	} else if r.ArtifactDigest != "" {
+		return fieldError("artifact_digest", "仅用于 frontend_static")
 	}
 	if !IsCommit(r.CommitID) {
 		return fieldError("commit_id", "须为完整的 40 或 64 位十六进制提交 ID")
@@ -55,7 +67,7 @@ func ValidateApplyRequest(r *ApplyRequest) error {
 	return nil
 }
 func ValidateRepoSiteDirectoryName(s string) error {
-	if !sitePattern.MatchString(s) || strings.Contains(s, "..") || s == "latest" || s == "releases" || s == "assets" {
+	if !sitePattern.MatchString(s) || strings.Contains(s, "..") || s == "current" || s == "latest" || s == "releases" || s == "assets" {
 		return fieldError("server_name", "须为安全、非保留的单段站点名称")
 	}
 	return nil

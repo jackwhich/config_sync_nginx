@@ -27,7 +27,10 @@ const (
 	NodeStatusRecoveryRequired NodeStatus = "recovery_required"
 )
 
+const FrontendORASCapability = "frontend_oras_v1"
+
 type ApplyRequest struct {
+	ArtifactDigest        string            `json:"artifact_digest,omitempty"`
 	ReleaseID             string            `json:"release_id"`
 	ExpectedStateRevision string            `json:"expected_state_revision"`
 	RestoreOf             string            `json:"restore_of,omitempty"`
@@ -51,6 +54,7 @@ type Step struct {
 	DurationMS int64      `json:"duration_ms"`
 }
 type Result struct {
+	ArtifactDigest      string      `json:"artifact_digest,omitempty"`
 	ReleaseID           string      `json:"release_id,omitempty"`
 	TargetID            string      `json:"target_id,omitempty"`
 	Status              NodeStatus  `json:"status"`

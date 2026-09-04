@@ -1,38 +1,52 @@
 // HTTP 发布流水线。Jenkins 的 agent 只指定构建执行器，节点部署用 curl 直连 HTTP。
-// 本 Job 发布配置/白名单：commit 取当前 Job 检出的 GitLab 仓库 GIT_COMMIT。
-// 回滚只用于前端发布 Job，不在本流水线提供。
+// 本 Job 只发布 config / whitelist；前端制品请使用独立的 Jenkinsfile。
+// 发布提交来自下方配置的 GitLab 仓库，而不是 Jenkinsfile 所在仓库。
 pipeline {
   agent any
-  options { timestamps(); disableConcurrentBuilds() }
+  options { timestamps(); disableConcurrentBuilds(); skipDefaultCheckout() }
   parameters {
     choice(name: 'ACTION', choices: ['update'], description: '配置/白名单发布')
+    choice(name: 'RELEASE_TYPE', choices: ['config', 'whitelist'], description: '发布类型；不支持 frontend_static')
     choice(name: 'SERVER_NAME', choices: ['ybf-uat-nginx', 'jp-ybf-uat-nginx'], description: '配置中允许的站点')
   }
   environment {
     RELEASE_ENV = 'uat'
-    RELEASE_TYPE = 'config'
     RELEASE_BRANCH = 'uat'
     RELEASE_PROJECT = 'ybf'
     RELEASE_PATH_DEST = '/data/nginx-publish'
+    // GitLab 制品仓库及其 Jenkins Username/Password 或 SSH 私钥凭据。
+    RELEASE_SOURCE_REPOSITORY_URL = 'https://dcproopsgitlab.opscom999.com/dc-ops/nginx_vhost.git'
+    RELEASE_SOURCE_CREDENTIAL_ID = 'gitlab_pushom'
+    // 节点 HTTP 发布 Token（Secret text 凭据），与 GitLab 检出凭据不同。
     RELEASE_CREDENTIAL_ID = 'release-token-uat'
     SERVICE_URLS_ybf_uat_nginx = 'http://127.0.0.1:9166,http://127.0.0.1:9167'
     SERVICE_URLS_jp_ybf_uat_nginx = 'http://127.0.0.1:9168,http://127.0.0.1:9169'
   }
   stages {
+    stage('Checkout release source') {
+      steps {
+        checkout([$class: 'GitSCM',
+          branches: [[name: "*/${env.RELEASE_BRANCH}"]],
+          doGenerateSubmoduleConfigurations: false,
+          extensions: [],
+          userRemoteConfigs: [[
+            credentialsId: env.RELEASE_SOURCE_CREDENTIAL_ID,
+            url: env.RELEASE_SOURCE_REPOSITORY_URL
+          ]]
+        ])
+      }
+    }
     stage('Prepare') {
       steps {
         script {
           if (!isUnix()) { error('发布执行器需要 curl，请使用 Linux 执行器') }
+          env.RELEASE_TYPE = params.RELEASE_TYPE
           env.RELEASE_SERVER_NAME = params.SERVER_NAME
           env.RELEASE_URLS = env["SERVICE_URLS_${params.SERVER_NAME.replace('-', '_')}"]
-          def gitBranch = env.GIT_BRANCH ?: env.BRANCH_NAME ?: env.RELEASE_BRANCH
-          env.RELEASE_BRANCH = gitBranch.replaceFirst(/^refs\/heads\//, '').replaceFirst(/^origin\//, '')
-          env.RELEASE_COMMIT = (env.GIT_COMMIT ?: '').trim().toLowerCase()
-          if (!env.RELEASE_COMMIT) {
-            env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()
-          }
+          env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()
+          if (!(env.RELEASE_TYPE in ['config', 'whitelist'])) { error('RELEASE_TYPE 只能为 config 或 whitelist') }
           if (!(env.RELEASE_COMMIT ==~ /(?:[a-f0-9]{40}|[a-f0-9]{64})/)) {
-            error('当前 Job 检出的 GitLab 提交必须是完整 SHA（GIT_COMMIT）')
+            error('GitLab 制品仓库当前提交必须是完整 SHA')
           }
           if (!env.RELEASE_URLS?.trim()) { error('未配置该站点的节点 HTTP 地址') }
           writeFile file: 'release-request.json', text: groovy.json.JsonOutput.toJson([

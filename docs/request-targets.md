@@ -137,6 +137,6 @@ restore_of 撤销批次仍要求 expected_state_revision，以确认没有其他
 
 reload 失败的错误码为 `NGINX_RELOAD_FAILED`。若旧配置检查或恢复 reload 也失败，返回 HTTP 503、`status: recovery_required`、`error_code: RECOVERY_FAILED`；error 同时保留原始失败和恢复失败详情，目标禁止继续发布。
 
-`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 用 curl 直连节点，非 200 即失败并打印响应体。自行用 curl 调用时同样要保留错误响应并以非零码结束，避免把 HTTP 500 当成脚本成功。
+`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 只发布 config/whitelist：先显式检出配置的 GitLab 制品仓库，再用 curl 直连节点；任一节点非 200 即失败并打印响应体。自行用 curl 调用时同样要保留错误响应并以非零码结束，避免把 HTTP 500 当成脚本成功。
 
 配置/白名单 Jenkins 参数与 HTTP 字段映射见 [Jenkins 发布说明](jenkins.md)。

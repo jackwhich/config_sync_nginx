@@ -248,7 +248,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 update 只接受新批次文件，resume 从原记录继续，rollback 从同一记录逆序恢复各节点自己的基线。节点身份、当前 revision 和服务能力会再次校验。批次文件有独立进程锁，并原子更新；不保存 Token。
 
-Jenkins 禁止同 Job 并发。配置/白名单 Job 只提供 update 和 SERVER_NAME；commit_id 使用当前 Job 检出的 GitLab 仓库 GIT_COMMIT，Jenkinsfile 用 curl 逐节点 POST apply。环境、类型、目录和节点地址写在流水线中。回滚只用于前端发布 Job。详见 [Jenkins 发布说明](docs/jenkins.md)。
+Jenkins 禁止同 Job 并发。配置/白名单 Job 只提供 update、RELEASE_TYPE 和 SERVER_NAME；Jenkinsfile 显式检出配置的 GitLab 制品仓库，commit_id 使用其 HEAD，并用 curl 逐节点 POST apply。环境、分支、目录和节点地址写在流水线中。前端发布与回滚使用独立 Job。详见 [Jenkins 发布说明](docs/jenkins.md)。
 
 ## 十一、可观测性
 

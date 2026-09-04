@@ -43,6 +43,7 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: env.CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
           withEnv(["RELEASE_ACTION=${params.ACTION}"]) {
+            // 客户端输出 nginx -t/reload 错误并非零退出；sh 直接使流水线失败。
             sh 'bash scripts/release-apply.sh "$RELEASE_ACTION" --batch-file "$RELEASE_BATCH_FILE"'
           }
         }

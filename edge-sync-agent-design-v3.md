@@ -2,11 +2,11 @@
 
 修订日期：2026-09-04。本文与本轮代码改造同步，沿用原文件名。部署架构为 HTTP 直连，没有发布中心、任务轮询、注册或结果回调。
 
-代码已实现下述发布事务和客户端协议，自动化测试包含本地 Git、HTTP 资源、故障注入和并发检查。真实 Nginx 专用实例测试提供了入口，但当前环境未运行；第十六节区分已覆盖的自动测试和上线环境验收，不能把代码完成视为生产配置已验证。
+代码已实现下述发布事务和客户端协议，自动化测试包含本地 Git、HTTP 资源、故障注入和并发检查。标准 Nginx 命令使用替身测试，未操作真实实例；第十六节区分已覆盖的自动测试和上线环境验收，不能把代码完成视为生产配置已验证。
 
 ## 一、目标与边界
 
-Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类型、站点、发布目录、分支及完整提交。配置/白名单从允许的 Git 仓库获取制品，前端通过 ORAS 拉取 Harbor 上固定 digest 的 dist.tar.gz，处理本机文件、指定 Nginx 实例和本地状态。
+Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类型、站点、发布目录、分支及完整提交。配置/白名单从允许的 Git 仓库获取制品，前端通过 ORAS 拉取 Harbor 上固定 digest 的 dist.tar.gz，处理本机文件，调用已有 nginx -t/reload 命令并保存本地状态。
 
 单次请求同步执行并返回最终结果。收到运行中冲突时调用方查询原记录，不创建后台任务队列。节点不可达时结果视为未知，批次停止推进。
 
@@ -14,9 +14,9 @@ Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类
 
 | 类型 | 制品 | 生效方式 |
 | --- | --- | --- |
-| config | Nginx 配置 | 原子切换、指定实例 nginx -t/reload、新 worker 与 HTTP 检查 |
+| config | Nginx 配置 | 原子切换、nginx -t 通过后 nginx -s reload、文件校验与可选 HTTP 探测 |
 | whitelist | Nginx 引用的白名单 | 同上，并配置实际放行/拒绝行为检查 |
-| frontend_static | Harbor OCI 中的 dist.tar.gz | 原子 latest 切换、指定 Nginx 测试/reload/worker 与 HTTP 摘要校验 |
+| frontend_static | Harbor OCI 中的 dist.tar.gz | 原子 latest 切换、nginx -t/reload、文件校验与可选 HTTP 摘要校验 |
 
 前端不执行构建，不自动修改 Nginx 路由。配置和白名单的 include 位置由运维预先配置，服务不会猜测主配置。
 
@@ -29,7 +29,7 @@ flowchart LR
     S -->|前端：oras pull 固定 digest| H[Harbor OCI dist.tar.gz]
     S --> L[节点共享互斥锁]
     S --> D[不可变快照与 latest]
-    S --> N[指定 Nginx 实例 / HTTP 验证]
+    S --> N[已有 nginx -t / reload / 可选 HTTP 验证]
     S --> J[目标事务 JSON]
     CI --> B[持久化逐节点批次记录]
 ```
@@ -55,9 +55,9 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 服务配置保留 data_dir、release_auth_tokens、日志、仓库连接信息和允许类型。listen_addr 默认 :9166，节点标识默认系统 hostname，默认锁为 data_dir/publish.lock；env 可按 Token 推导。Git 的 allowed_branches 可选；前端使用 oras.binary、oras.registry_config 和 oras.repository（可包含 {server_name}）。
 
-已有单 Nginx 实例自动识别 master 二进制和启动参数，不要求 nginx 配置块。多实例可通过可选 pid_file 选择；完整路径配置仍兼容。服务不安装或启动另一份 Nginx。业务 HTTP 检查为可选高级配置，默认确认本地快照、nginx -t、reload、新 worker。
+服务不配置或识别 Nginx 实例，调用 PATH 中已有的 nginx -t，通过后执行 nginx -s reload。删除 nginx 路径块、PID/进程扫描、启动参数解析、worker 检查及直接 HUP。默认确认文件完整性、配置检查与 reload 命令结果；HTTP 探测保留为可选项。
 
-每个目标至少有一条带内容断言的 health_checks，可设置 URL、Host、TLS server name、HTTP 状态及 contains。`{commit}` 可用于 URL/contains，运行时替换。首次无 latest 时使用单独的 initial_health_checks；无可验证基线不能假定恢复成功。
+可选 health_checks 带内容断言，可设置 URL、Host、TLS server name、HTTP 状态及 contains。`{commit}` 可用于 URL/contains，运行时替换。首次无 latest 时使用单独的 initial_health_checks；不配置探测时只校验文件基线和命令返回，不声称验证业务响应。
 
 默认资源约束：
 
@@ -129,7 +129,7 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 | --- | --- |
 | status | running / succeeded / skipped / failed / recovery_required |
 | phase | 最近执行阶段 |
-| activation_status | unchanged / verified / restored / unknown |
+| activation_status | unchanged / reload_requested / restored / unknown |
 | rollback_status | not_needed / succeeded / failed / unavailable |
 | state_revision_before / after | 操作前后修订号 |
 | error_code / error | 机器可识别错误与说明 |
@@ -137,6 +137,8 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 | steps | 有限阶段的结果和耗时 |
 
 成功/跳过 200；无效输入 400/413；鉴权 401/403；竞争、幂等参数或修订号冲突 409；已接收操作执行失败 500；状态不确定或恢复失败 503。HTTP 连接超时只代表客户端没有拿到结论。
+
+配置检查失败使用 NGINX_TEST_FAILED，reload 失败使用 NGINX_RELOAD_FAILED；恢复成功仍返回 HTTP 500，恢复失败使用 RECOVERY_FAILED 返回 HTTP 503。error 与 steps[].message 保留命令诊断。批量客户端输出具体错误、保存批次并非零退出，Jenkins 停止，后续节点不再发布。详见 [错误响应与 Jenkins](docs/request-targets.md#错误响应与-jenkins)。
 
 ## 六、节点执行事务
 
@@ -149,7 +151,7 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 7. 复用或创建不可变快照。前端使用 `<server_name>/<完整SHA>`，其他类型使用 releases/<SHA>；仅 shared_assets=true 时安装共享哈希资源。同一 SHA 的既有快照来源摘要不同会拒绝。
 8. 再次确认 latest 未被外部修改，持久化候选、发布前链接、完整本地基线和 switch_intent。
 9. 切换阶段使用独立于 HTTP 客户端的执行上下文，原子替换 latest。
-10. 所有类型执行指定实例 nginx -t、reload、新 worker 与 HTTP 行为验证；前端额外校验公开文件摘要，shared_assets=true 时再校验旧资源。
+10. 所有类型先执行 nginx -t，通过后执行 nginx -s reload，并校验本地快照。配置 HTTP 探测时验证对应 URL；前端配置 public_base_url 时额外校验公开文件摘要。
 11. 一次原子状态写入同时提交 current、previous、新 revision、请求 succeeded 及最终结果。
 12. 清理历史版本，清理失败记录 warnings。
 
@@ -209,7 +211,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 启动时持节点锁检查：
 
 - 无切换意图的中断操作：发布失败、链接不变。
-- 有意图且 latest 为候选：校验本地快照，重新测试/reload（如适用）并验证，确认后提交。
+- 有意图且 latest 为候选：校验本地快照，重新执行 nginx -t，通过后 reload并验证，确认后提交。
 - latest 为原基线或候选不能确认：按本地基线恢复、验证，提交失败结果与新 revision。
 - latest 不属于已记录候选/基线：保留现场，要求人工处理。
 - 既有成功状态：比对当前链接、快照和 HTTP；不一致时阻止新发布。
@@ -219,9 +221,9 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 ## 九、恢复与回滚
 
-单次发布自动恢复只使用本节点请求前保存的已验证快照，不 fetch Git，不依赖网络分支状态。重新切回原链接，测试/reload（如适用），验证旧行为。恢复成功仍表示本次发布失败，结果为 failed + restored + rollback succeeded，并生成新 revision。
+单次发布自动恢复只使用本节点请求前保存的已验证快照，不 fetch Git，不依赖网络分支状态。重新切回原链接，执行 nginx -t，通过后 reload，校验旧文件和可选 HTTP 入口。恢复成功仍表示本次发布失败，结果为 failed + restored + rollback succeeded，并生成新 revision。
 
-首次发布原来没有 latest，恢复删除新链接并检查 Nginx worker；高级配置提供 initial_health_checks 时也检查原入口。恢复失败则 recovery_required，禁止后续发布。
+首次发布原来没有 latest，恢复删除新链接并执行 nginx -t，通过后执行 nginx -s reload；高级配置提供 initial_health_checks 时也检查原入口。恢复失败则 recovery_required，禁止后续发布。
 
 正常人工发布旧提交可发新的 apply。撤销指定批次操作则发新 release_id，restore_of 引用同目标、同环境的一次 succeeded：
 
@@ -284,7 +286,7 @@ commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签
 
 ### 11.3 告警接入
 
-`configs/prometheus-alerts.example.yml` 提供 9 条规则：发布失败、抓取不可达、发布不可用、步骤失败、自动恢复失败、状态写失败、清理失败、执行超时及集中 401/403。步骤标签可区分 fetch、nginx_test、reload 和实际生效检查。执行超时默认 10 分钟并持续 1 分钟，应匹配部署的执行/恢复时间预算。
+`configs/prometheus-alerts.example.yml` 提供 9 条规则：发布失败、抓取不可达、发布不可用、步骤失败、自动恢复失败、状态写失败、清理失败、执行超时及集中 401/403。步骤标签可区分 fetch、nginx_test、reload 和文件/可选 HTTP 检查。执行超时默认 10 分钟并持续 1 分钟，应匹配部署的执行/恢复时间预算。
 
 `configs/prometheus-scrape.example.yml` 已包含 rule_files 和 Alertmanager 连接示例；记录规则和告警文件应随配置安装。实际通知由现有 Alertmanager 接收方配置负责，本仓库不预设邮箱或 webhook。接入前用 `promtool check config`、`promtool check rules` 验证并做故障演练；本地没有 promtool 时不能把 Go 测试视为告警表达式执行验证。规则说明见 [Prometheus 官方文档](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)。
 
@@ -310,7 +312,7 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | --- | --- |
 | 拉取/解包/制品校验失败 | failed，latest 不变 |
 | 基线链接或内容漂移 | 阻止切换，待恢复 |
-| nginx -t/reload/新 worker/HTTP 检查失败 | 恢复本地基线后报告失败 |
+| nginx -t/reload 命令、本地文件或可选 HTTP 检查失败 | 恢复本地基线后返回 HTTP 500 和错误详情；恢复失败返回 HTTP 503 |
 | 恢复失败或状态写入不确定 | recovery_required，阻止新发布 |
 | 清理失败 | 已成功结果保留，warnings/日志告警 |
 | 同 ID 参数变化或 revision 变化 | 409，不覆盖旧操作 |
@@ -342,7 +344,7 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | internal/domain/release | 请求/响应协议、身份与参数验证 |
 | internal/domain/target | 授权目标和健康检查模型 |
 | internal/domain/state | 快照清单、版本、发布记录与目标事务状态 |
-| internal/infrastructure/nginx | 指定实例测试/reload、worker 与 HTTP 生效验证 |
+| internal/infrastructure/nginx | 调用已有 nginx -t、nginx -s reload 与可选 HTTP 探测 |
 | internal/infrastructure/state | 事务模型的单文件 JSON 持久化 |
 | internal/infrastructure/fsutil | 目录句柄、原子写与受限清理 |
 | internal/infrastructure/git | Git 类型的允许来源、提交校验、归档 |
@@ -353,7 +355,7 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | internal/config | 严格 YAML、参数与目标映射校验 |
 | scripts / Jenkinsfile | 可选客户端：持久化逐节点 HTTP 批次、前端清单工具 |
 
-依赖规则：HTTP 适配器通过 `Publisher` 接口调用用例；应用层处理发布流程并调用基础设施，Nginx 运行环境通过 `Runtime` 接口替换。基础设施负责外部系统操作。领域模型不依赖接口层、应用层、基础设施或配置加载器。配置加载器复用领域目标类型，存储层复用领域事务类型，避免领域对象反向依赖 YAML 或 JSON 文件存储实现。
+依赖规则：HTTP 适配器通过 `Publisher` 接口调用用例；应用层处理发布流程并调用基础设施，配置检查、reload 命令及可选 HTTP 探测通过 `Runtime` 接口替换。基础设施负责外部系统操作。领域模型不依赖接口层、应用层、基础设施或配置加载器。配置加载器复用领域目标类型，存储层复用领域事务类型，避免领域对象反向依赖 YAML 或 JSON 文件存储实现。
 
 ## 十六、验收
 
@@ -372,7 +374,8 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | 不同 data_dir/lock 接管同目录 | 归属校验拒绝 |
 | A→B→A 后陈旧 revision | 409 |
 | 客户端取消准备/关键阶段断开 | 准备失败不切换；关键事务继续 |
-| Nginx 测试失败、reload 无实际生效 | 恢复基线，报告 failed |
+| nginx -t 失败、reload 非零退出或可选 HTTP 验证失败 | 恢复基线，HTTP 500 返回命令错误；检查失败不 reload 候选配置 |
+| Jenkins 收到节点语法错误 | 输出错误码与报错详情，退出码 1，不继续发布下一台 |
 | 恢复失败/成功提交落盘失败 | recovery_required，重启收敛 |
 | 当前文件或 latest 漂移 | 不误报 skipped |
 | 无意图中断/有意图启动恢复 | 根据耐久记录收敛 |
@@ -389,17 +392,19 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | 老服务预检/响应丢失/批次磁盘失败 | 写入前停止、按原 ID 查、持久化失败不 POST |
 | 节点旧版本不同/恢复期间版本改变 | 各自恢复或停止 |
 
+自动化命令测试 `go test ./internal/application/publisher -run TestStandardNginxCommandsAndRollback -v` 使用 PATH 中的替身 nginx，核对三种类型的 -t/-s reload 参数、错误详情、切换/恢复时序，以及启动和重启不扫描或控制宿主进程。
+
 还需在目标环境执行的验收：
 
-1. `NGINX_TEST_BINARY=/实际/nginx go test ./internal/application/publisher -run TestRealNginxActivationAndRecovery -v`：专用实例的 reload、新 worker、语法失败恢复、HTTP 不符合预期的恢复。
-2. 真实站点 include/白名单规则、Host/SNI、文件访问权限与 PID 配置一致性。
+1. 服务账号执行已有 nginx -t 和 nginx -s reload 的权限与 PATH。
+2. 真实站点 include/白名单规则、Host/SNI、文件访问权限与原有 include/root。
 3. 真实前端浏览器旧页面懒加载、CDN/缓存期限、动态资源路径与跨版本路由。
 4. Jenkins 凭据、持久归档和 Copy Artifact 权限；中断后使用原批次文件恢复。
 5. 真实 Harbor 的 Robot、代理、CA、SHA 不可变标签及 prod 发布后更新。
 6. 部署文件系统上的异常断电/fsync 行为，以及长期磁盘容量和记录归档方案。
 
-当前没有实际 Nginx 二进制，下载未获批准，第 1 项未运行。不能把 Runtime 注入测试等同于该实例验收。测试应使用隔离目录和专用实例。
+自动化测试使用替身命令，不操作真实 Nginx。现场验证服务账号能运行既有 nginx -t 和 nginx -s reload；真实业务响应按现有运维方式验收。
 
 ## 十七、上线检查顺序
 
-先验证新配置、可信基线和 HTTP 入口，再对专用实例完成第十六节验收。升级节点服务与批量客户端，保留旧快照和原批次记录。上线逐节点检查 release_contract、node_id、目标映射和 publish_ready，首个节点确认后再推进。出现 recovery_required 时先查原 release_id 与实际链接，修复并启动恢复，不以新 ID 强行覆盖。
+先验证服务配置、可信基线和 HTTP 入口，再按第十六节验收既有站点。升级节点服务与批量客户端，保留旧快照和原批次记录。上线逐节点检查 release_contract、node_id、目标映射和 publish_ready，首个节点确认后再推进。出现 recovery_required 时先查原 release_id 与实际链接，修复并启动恢复，不以新 ID 强行覆盖。

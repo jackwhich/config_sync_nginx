@@ -1,0 +1,23 @@
+groups:
+  - name: nginx-http-release
+    rules:
+      - alert: NginxHTTPReleaseFailed
+        expr: increase(nginx_updata_config_release_terminal_total{status="failed"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Nginx HTTP publication failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseUnavailable
+        expr: up{job="nginx-http-release"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Nginx HTTP release endpoint unavailable'
+      - alert: NginxHTTPReleaseNeedsRecovery
+        expr: nginx_updata_config_publish_ready == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Publication blocked on {{ $labels.node_id }}; inspect /healthz and release state'

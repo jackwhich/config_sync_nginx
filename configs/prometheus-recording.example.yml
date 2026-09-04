@@ -1,0 +1,7 @@
+groups:
+  - name: nginx-http-release
+    rules:
+      - record: nginx_release:failures:rate5m
+        expr: sum by (env, release_type, target_id) (rate(nginx_updata_config_release_terminal_total{status="failed"}[5m]))
+      - record: nginx_release:step:p95
+        expr: histogram_quantile(0.95, sum by (le, env, release_type, target_id, step) (rate(nginx_updata_config_release_step_duration_seconds_bucket[5m])))

@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"nginx_updata_config/internal/config"
-	"nginx_updata_config/internal/domain/release"
 	"nginx_updata_config/internal/domain/state"
 	"nginx_updata_config/internal/infrastructure/process"
 	"os"
@@ -90,7 +89,7 @@ func (n *Runtime) Verify(ctx context.Context, t config.Target, commit string, in
 	var last error
 	for {
 		last = nil
-		if t.Type != release.ReleaseTypeFrontendStatic {
+		{
 			p, e := n.workers(ctx)
 			last = e
 			if e == nil && n.reloaded {

@@ -63,6 +63,49 @@ func (c Client) command(ctx context.Context, dir string, args ...string) error {
 	return err
 }
 
+// Resolve reads the immutable-SHA tag once; Pull then uses only the returned digest.
+func (c Client) Resolve(ctx context.Context, target config.Target, commit string) (string, error) {
+	if err := config.ValidateArtifactRepository(target.ArtifactRepository); err != nil {
+		return "", err
+	}
+	if !release.IsCommit(commit) {
+		return "", fmt.Errorf("invalid commit ID")
+	}
+	root, err := os.OpenRoot(c.DataDir)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	rel := "worktrees/oras-resolve-" + release.ID()
+	if err := fsutil.EnsureDirs(root, rel, 0700); err != nil {
+		return "", err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = fsutil.RemoveTree(cleanup, root, rel)
+	}()
+	work := filepath.Join(c.DataDir, rel)
+	if err := c.command(ctx, work, "manifest", "fetch", target.ArtifactRepository+":"+commit, "--output", filepath.Join(work, "manifest.json")); err != nil {
+		return "", err
+	}
+	dir, err := root.OpenRoot(rel)
+	if err != nil {
+		return "", err
+	}
+	defer dir.Close()
+	raw, err := readLimited(dir, "manifest.json", 128<<10)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(raw)
+	digest := "sha256:" + hex.EncodeToString(hash[:])
+	if _, err := validateManifest(raw, commit, digest, c.MaxBytes); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
 func (c Client) Pull(ctx context.Context, target config.Target, commit, digest string) (work string, err error) {
 	if err = config.ValidateArtifactRepository(target.ArtifactRepository); err != nil {
 		return "", err

@@ -148,3 +148,44 @@ func TestPinnedPullValidatesManifestAndCleansFailedWork(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveSHATagThenPullPinnedDigest(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	archive := bundle(t, []tar.Header{{Name: "index.html", Typeflag: tar.TypeReg, Mode: 0644, Size: 4}})
+	m := manifest{SchemaVersion: 2, MediaType: "application/vnd.oci.image.manifest.v1+json", ArtifactType: ArtifactType, Config: descriptor{Size: 2, Digest: sha([]byte("{}"))}, Annotations: map[string]string{"org.opencontainers.image.revision": commit}, Layers: []descriptor{{MediaType: "application/gzip", Digest: sha(archive), Size: int64(len(archive)), Annotations: map[string]string{titleAnnotation: "dist.tar.gz"}}}}
+	raw, _ := json.Marshal(m)
+	digest := sha(raw)
+	target := config.Target{ServerName: "site", ArtifactRepository: "harbor.example.com/web/site-dist"}
+	c := Client{DataDir: t.TempDir(), MaxBytes: 1 << 20, MaxFiles: 100}
+	calls := 0
+	c.run = func(ctx context.Context, dir string, args []string) error {
+		calls++
+		want := target.ArtifactRepository + "@" + digest
+		if calls == 1 {
+			want = target.ArtifactRepository + ":" + commit
+		}
+		if !strings.Contains(strings.Join(args, " "), want) {
+			t.Fatal(args)
+		}
+		output := ""
+		for i, arg := range args {
+			if arg == "--output" {
+				output = args[i+1]
+			}
+		}
+		if args[0] == "manifest" {
+			return os.WriteFile(output, raw, 0600)
+		}
+		return os.WriteFile(filepath.Join(output, "dist.tar.gz"), archive, 0600)
+	}
+	resolved, err := c.Resolve(context.Background(), target, commit)
+	if err != nil || resolved != digest {
+		t.Fatal(resolved, err)
+	}
+	if _, err := c.Pull(context.Background(), target, commit, resolved); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatal(calls)
+	}
+}

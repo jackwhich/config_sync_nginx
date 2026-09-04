@@ -1,6 +1,6 @@
 [Unit]
 Description=Nginx synchronous HTTP release service
-After=network-online.target nginx.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

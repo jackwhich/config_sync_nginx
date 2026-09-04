@@ -2,6 +2,9 @@
 data/
 dist/
 bin/
+# 发布到仓库的 Linux 二进制在 releases/，不要被 dist/bin 规则误伤。
+!releases/
+!releases/**
 __pycache__/
 *.py[cod]
 .DS_Store

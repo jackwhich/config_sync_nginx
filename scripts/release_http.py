@@ -117,7 +117,7 @@ def preflight(http, urls, request):
             raise ReleaseError(url + " is not ready for HTTP release contract 2")
         require_frontend_capability(health, request)
         node_id = health.get("node_id")
-        if not node_id or node_id in seen or health.get("env") != request["env"]:
+        if not node_id or node_id in seen or request["env"] not in health.get("enabled_envs", [health.get("env")]):
             raise ReleaseError("duplicate/missing node_id or environment mismatch: " + url)
         seen.add(node_id)
         baseline = require(*http.call(url, state_path(request["env"], request=request)))
@@ -133,7 +133,7 @@ def preflight(http, urls, request):
 def identity(http, node, env):
     health = require(*http.call(node["url"], "/healthz"))
     require_frontend_capability(health, node["request"])
-    if health.get("release_contract") != 2 or health.get("node_id") != node["node_id"] or health.get("env") != env:
+    if health.get("release_contract") != 2 or health.get("node_id") != node["node_id"] or env not in health.get("enabled_envs", [health.get("env")]):
         raise ReleaseError("endpoint identity or contract changed: " + node["url"])
 
 

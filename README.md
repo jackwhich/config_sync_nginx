@@ -2,11 +2,38 @@
 
 Jenkins 或脚本通过 HTTP 同步调用每台节点。服务从配置允许的 Git 仓库提取指定站点和完整提交，生成不可变快照，切换 `latest`，验证 Nginx 生效后原子提交状态。失败时用本节点发布前快照恢复。
 
-当前代码采用 HTTP 发布协议 2。旧 `internal/agent` 入口已移除，实现位于 `internal/service`。不使用拉取任务、注册、心跳上报或 desired_state。设计说明见 [HTTP 设计文档](edge-sync-agent-design-v3.md)（沿用原文件名便于追踪）。
+当前代码采用 HTTP 发布协议 2。旧 `internal/agent` 入口已移除，实现按接口、应用、领域、基础设施分层。不使用拉取任务、注册、心跳上报或 desired_state。设计说明见 [HTTP 设计文档](edge-sync-agent-design-v3.md)（沿用原文件名便于追踪）。
+
+## 代码分层
+
+```text
+cmd/nginx_updata_config/      # 程序启动、依赖组装、关停
+internal/
+  interfaces/httpapi/         # 路由、认证、IP 限制、JSON 访问日志
+  application/publisher/      # 发布事务、幂等、恢复、清理编排
+  domain/
+    release/                 # 请求、结果、身份校验
+    target/                  # 发布目标与健康检查模型
+    state/                   # 快照、版本、事务记录模型
+    auth/                    # 认证协议常量
+  infrastructure/
+    nginx/                   # Nginx 进程与实际 HTTP 生效检查
+    git/                     # Git 来源、导出与解包
+    state/                   # 事务 JSON 持久化
+    fsutil/ lock/ process/   # 文件、锁和子进程
+    applog/ prom/            # JSON 日志和 Prometheus 指标
+  config/                    # 配置解析与校验
+scripts/                     # 可选 HTTP 客户端、制品清单生成工具
+configs/                     # 服务、监控与告警配置示例
+```
+
+HTTP 层依赖 `Publisher` 接口；应用层编排领域对象和基础设施操作，Nginx 操作通过 `Runtime` 接口调用。领域层不依赖 HTTP、配置加载器或基础设施；磁盘存储实现与事务模型分离。配置模块负责把 YAML 转为已验证的参数。
+
+Python 只承担两项辅助工作：`release_http.py` 持久保存多节点请求和恢复进度，`frontend-manifest.py` 为已构建的前端资源生成摘要清单。HTTP 协议本身不绑定 Python，Go 服务不会启动这些脚本。当前保留这些可选工具，避免在客户端实现尚未替换时丢失断线续传与逐节点恢复能力。
 
 ## 构建与启动
 
-运行依赖：Linux、Git、已安装的 Nginx；构建需要 Go 1.25+。客户端需要 Python 3.9+。使用 Linux 本地文件系统保存状态、锁和快照。
+运行依赖：Linux、Git、已安装的 Nginx；构建需要 Go 1.25+。节点服务不需要 Python。可选批量客户端和前端清单工具需要 Python 3.9+，也可以由 Jenkins 或其他语言直接调用 HTTP 接口。使用 Linux 本地文件系统保存状态、锁和快照。
 
 ```bash
 go test ./...
@@ -146,6 +173,43 @@ python3 scripts/frontend-manifest.py path/to/ybf-uat-web
 
 `asset_retention` 必须覆盖客户端存活、缓存和懒加载窗口。清理保护当前、上一版本、运行中候选/基线及前端兼容窗口，至少保留 `keep_releases` 个最近创建快照。清理失败只返回 warnings；不撤销已确认的成功。
 
+## JSON 日志与告警
+
+所有服务运行日志逐行输出 JSON，默认 stdout，可用 `log_file` 指定绝对文件路径。基础字段统一为 `time`（UTC RFC3339）、`level`、`message`、`event`；不再使用旧的 `ts/msg/fields` 结构，日志采集规则需要同步更新。
+
+一次 HTTP 请求完成后的访问日志示例：
+
+```json
+{"time":"2026-09-04T08:30:00Z","level":"info","message":"HTTP 请求完成","event":"http_access","request_id":"70a0aa0b-ed68-4abf-9f76-58fe71777dfe","client_ip":"192.0.2.10","peer_ip":"10.0.0.2","method":"POST","path":"/api/v1/releases/apply","status_code":200,"duration_ms":1520.5,"bytes_written":860,"node_id":"nginx-uat-01","env":"uat"}
+```
+
+访问日志覆盖进入处理器的成功、401/403、404/405、限流和 500 请求。2xx/3xx 为 info，4xx 为 warn，5xx/异常为 error。`client_ip` 使用与访问控制相同的可信代理解析，`peer_ip` 为实际连接来源；响应头 `X-Request-ID` 可关联日志。发布请求还记录 `release_id/target_id/release_status/error_code`。不记录 Token、请求体、查询字符串或全部请求头。
+
+发布步骤和最终结果日志包含 `release_id`、`target_id`、`status`、`duration_ms`，失败使用 error 级别。服务内部及启动失败日志也使用 JSON。非 HTTP 事件不伪造访问 IP 或 HTTP 状态码。
+
+`GET /metrics` 输出 Prometheus 指标。完整清单见 [设计文档的可观测性章节](edge-sync-agent-design-v3.md#十一可观测性)。已配置目标的计数器启动时初始化为 0，幂等重放不会增加发布结果计数；`commit/release_id/client_ip` 不作为指标标签。
+
+| 告警 | 默认触发条件 |
+| --- | --- |
+| NginxHTTPReleaseFailed | 10 分钟内发布失败 |
+| NginxHTTPReleaseUnavailable | Prometheus 连续 2 分钟抓取失败 |
+| NginxHTTPReleaseNeedsRecovery | 发布不可用持续 1 分钟 |
+| NginxHTTPReleaseStepFailed | 10 分钟内任一发布步骤失败，可按 step 定位 Git、校验、reload 等 |
+| NginxHTTPReleaseRollbackFailed | 10 分钟内本地自动恢复失败 |
+| NginxHTTPReleaseStateWriteFailed | 10 分钟内权威状态写入失败 |
+| NginxHTTPReleaseCleanupFailed | 10 分钟内快照或导出目录清理失败 |
+| NginxHTTPReleaseStuck | 正在执行超过 10 分钟，持续 1 分钟；需按 execution/recovery 超时调整 |
+| NginxHTTPReleaseAccessDenied | 5 分钟内同一实例 401/403 至少 10 次 |
+
+接入步骤：
+
+1. 将 [抓取配置](configs/prometheus-scrape.example.yml)、[记录规则](configs/prometheus-recording.example.yml)、[告警规则](configs/prometheus-alerts.example.yml) 放在同一 Prometheus 配置目录，合并配置或使用该抓取配置启动 Prometheus。
+2. 修改节点地址、Alertmanager 地址，将 Prometheus 来源加入服务 `allowed_client_ips`。
+3. 执行 `promtool check config configs/prometheus-scrape.example.yml` 和 `promtool check rules configs/prometheus-alerts.example.yml configs/prometheus-recording.example.yml`，然后重载 Prometheus。
+4. 在已有 Alertmanager 配置通知接收方，并做一次故障演练。仓库提供指标和规则，不代表已经接入实际通知渠道。
+
+规则编写和通知机制参考 [Prometheus 告警规则文档](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)。本地未安装 promtool 时，应在监控部署环境执行上述检查。
+
 ## 旧版本迁移
 
 旧配置不能直接用于新服务；严格解析会拒绝字符串 targets、hostname、app 等旧字段。旧状态按 project/site 定位，不能直接当作新目标状态。
@@ -174,7 +238,7 @@ go test -race ./...
 go vet ./...
 python3 -m unittest discover -s scripts -p '*_test.py'
 # 可选：实际安装的 Nginx，测试自行创建专用实例/端口/目录
-NGINX_TEST_BINARY=/usr/sbin/nginx go test ./internal/service/runner -run TestRealNginxActivationAndRecovery -v
+NGINX_TEST_BINARY=/usr/sbin/nginx go test ./internal/application/publisher -run TestRealNginxActivationAndRecovery -v
 make dist-linux-amd64 VERSION=http-v2
 make dist-linux-arm64 VERSION=http-v2
 ```

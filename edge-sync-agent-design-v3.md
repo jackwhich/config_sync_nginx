@@ -33,7 +33,7 @@ flowchart LR
     CI --> B[持久化逐节点批次记录]
 ```
 
-旧 `internal/agent` 门面与调用已删除，实现统一位于 `internal/service`。Jenkins 自身的 `agent any` 是构建执行器配置，与本系统部署通信方式无关。
+旧 `internal/agent` 门面与调用已删除，实现已拆为 `internal/interfaces`、`internal/application`、`internal/domain` 和 `internal/infrastructure`，配置加载独立放在 `internal/config`。Jenkins 自身的 `agent any` 是构建执行器配置，与本系统部署通信方式无关。
 
 ## 三、身份与授权
 
@@ -219,7 +219,11 @@ HTML/探针不缓存；资源可使用不可变缓存。asset_retention 至少�
 
 ## 十、批量客户端与 Jenkins
 
-`scripts/release_http.py` 使用 Python 标准库；shell 文件是入口。配置 RELEASE_URLS、ENV、TYPE、BRANCH、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token。
+节点 HTTP 服务全由 Go 实现，运行时不依赖 Python，也不会启动 Python 子进程。HTTP 协议与调用语言无关。
+
+当前 `scripts/release_http.py` 是可选批量客户端，使用 Python 标准库；shell 文件是入口。保留 Python 的原因是该工具实现了逐节点批次落盘、未知结果查询和安全恢复，而不是服务端还存在 Agent。`scripts/frontend-manifest.py` 是构建后的制品清单工具，同样不在节点服务运行路径中。只需直接 HTTP 调用时，可以使用 curl、Jenkins 或其他语言；采用自建客户端仍需遵守以下持久化与恢复约束。
+
+客户端配置 RELEASE_URLS、ENV、TYPE、BRANCH、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token。
 
 新批次先预检全部节点、确认 node_id 不重复，再把每个节点 target_id、baseline、revision、原 UUID 和完整请求原子写到批次文件。持久化成功后才发送 HTTP。
 
@@ -231,17 +235,43 @@ Jenkins 禁止同 Job 并发，归档批次文件。resume/rollback 通过 SOURC
 
 ## 十一、可观测性
 
-JSON 日志包含 release_id、target_id、有限阶段、结果和耗时，不输出 Token。Prometheus 维度如下：
+### 11.1 日志契约
 
-| 指标后缀 | 维度 |
-| --- | --- |
-| http_requests_total | 有限 handler/code |
-| http_request_duration_seconds | 有限 handler |
-| release_terminal_total | 已授权 env/type/target_id/status |
-| release_step_duration_seconds | 已授权目标、有限 step/status |
-| publish_ready | 配置 env/node_id |
+服务运行日志为每行一个 JSON 对象，默认 stdout；`log_file` 可指定绝对路径。统一顶层字段：`time`（UTC RFC3339Nano）、`level`（info/warn/error）、`message`、`event`。旧 `ts/msg/fields` 字段已替换，采集规则同步调整。
 
-commit、release_id、任意请求 project 不作 Prometheus 标签。未授权和无效请求只影响有限的 HTTP 计数。示例规则覆盖发布失败、执行器不可达和待恢复。
+HTTP 访问日志 event=http_access：`request_id`、`node_id`、`env`、`client_ip`、`peer_ip`、`method`、`path`、`status_code`、`duration_ms`、`bytes_written`。发布请求补充 `release_id`、`target_id`、`release_status`、`error_code`。响应头返回服务生成的 `X-Request-ID`。
+
+日志记录每个进入处理器的请求，包括认证失败、IP 拒绝、未知路由、限流与 panic；2xx/3xx 为 info、4xx 为 warn、5xx/panic 为 error。异常恢复在尚未写响应时返回 500。IP 与授权使用同一可信代理链解析；没有可信客户地址时为空，不使用伪造头。请求体、Token、查询字符串和完整头集合不写日志。
+
+业务步骤与结果日志记录 release_id、target_id、有限阶段、业务 status、rollback_status 和耗时；失败使用 error。清理失败使用 warn。启动和 HTTP 服务器内部错误也通过 JSON 日志器输出。非 HTTP 事件没有访问 IP/HTTP 状态码时不补造数值。
+
+### 11.2 指标契约
+
+所有自定义指标前缀为 `nginx_updata_config_`：
+
+| 指标后缀 | 类型及维度 | 含义 |
+| --- | --- | --- |
+| http_requests_total | Counter，handler/code | HTTP 响应数，路由固定枚举 |
+| http_request_duration_seconds | Histogram，handler | HTTP 请求耗时 |
+| release_terminal_total | Counter，env/release_type/target_id/status | 已接受事务的 succeeded/skipped/failed，重放不重计 |
+| release_step_duration_seconds | Histogram，env/release_type/target_id/step/status | 已执行阶段耗时 |
+| release_step_failures_total | Counter，env/release_type/target_id/step | 阶段失败次数 |
+| rollback_total | Counter，env/release_type/target_id/status | 本地自动恢复尝试，succeeded/failed |
+| cleanup_failures_total | Counter，env/release_type/target_id | 历史快照或导出目录清理失败 |
+| state_persist_failures_total | Counter，env/release_type/target_id | 权威状态写入失败 |
+| publish_ready | Gauge，env/node_id | 发布执行器是否可用 |
+| target_recovery_required | Gauge，env/release_type/target_id | 目标是否待恢复 |
+| release_in_progress | Gauge，env/release_type/target_id | 是否正在处理发布事务 |
+| release_started_timestamp_seconds | Gauge，env/release_type/target_id | 当前事务开始时间，空闲为 0 |
+| last_success_timestamp_seconds | Gauge，env/release_type/target_id | 当前持久版本验证时间，无版本为 0 |
+
+commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签。未授权/无效请求只影响有限的 HTTP 计数。目标和阶段计数器在启动时建立零值，阶段来自固定枚举。恢复标记及当前版本验证时间在 health/metrics 请求时从状态视图刷新，重启后仍可观测；Counter 统计本进程事件，应使用 rate/increase 处理重启。
+
+### 11.3 告警接入
+
+`configs/prometheus-alerts.example.yml` 提供 9 条规则：发布失败、抓取不可达、发布不可用、步骤失败、自动恢复失败、状态写失败、清理失败、执行超时及集中 401/403。步骤标签可区分 fetch、nginx_test、reload 和实际生效检查。执行超时默认 10 分钟并持续 1 分钟，应匹配部署的执行/恢复时间预算。
+
+`configs/prometheus-scrape.example.yml` 已包含 rule_files 和 Alertmanager 连接示例；记录规则和告警文件应随配置安装。实际通知由现有 Alertmanager 接收方配置负责，本仓库不预设邮箱或 webhook。接入前用 `promtool check config`、`promtool check rules` 验证并做故障演练；本地没有 promtool 时不能把 Go 测试视为告警表达式执行验证。规则说明见 [Prometheus 官方文档](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)。
 
 ## 十二、部署和迁移
 
@@ -275,7 +305,7 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 
 | 旧行为/缺陷 | 当前实现 |
 | --- | --- |
-| Agent 命名和门面 | internal/service 直接分层 |
+| Agent 命名和门面 | HTTP 接口、应用编排、领域模型、基础设施明确分层 |
 | 用 version 创建/删除工作目录 | 随机临时目录；version 仅展示 |
 | latest 切换失败后不恢复 | 耐久意图、独立恢复期限和本地基线 |
 | 只按 commit 跳过 | 基线链接/摘要/HTTP 验证后才 skipped |
@@ -291,17 +321,22 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 
 | 位置 | 职责 |
 | --- | --- |
-| cmd/nginx_updata_config | 配置检查、迁移入口、HTTP 启动和关停 |
+| cmd/nginx_updata_config | 配置检查、迁移入口、依赖组装、HTTP 启动和关停 |
+| internal/interfaces/httpapi | 严格 JSON、认证、来源限制、HTTP 路由、访问日志 |
+| internal/application/publisher | 发布事务、幂等、版本及资源策略、启动恢复与迁移 |
 | internal/domain/release | 请求/响应协议、身份与参数验证 |
-| internal/service/api | 严格 JSON、认证、来源限制、HTTP 路由 |
-| internal/service/config | 严格 YAML、目标与权限边界 |
-| internal/service/runner | 事务、快照、前端、Nginx 验证、启动恢复与迁移 |
-| internal/service/state | 单文件权威状态 |
-| internal/service/fsutil | 目录句柄、原子写与受限清理 |
-| internal/service/git | 允许来源、提交校验、受限归档 |
-| internal/service/lock / process | 共享锁、子进程期限与进程组 |
-| internal/service/prom / applog | 有限指标与结构化日志 |
-| scripts / Jenkinsfile | 持久化逐节点 HTTP 批次 |
+| internal/domain/target | 授权目标和健康检查模型 |
+| internal/domain/state | 快照清单、版本、发布记录与目标事务状态 |
+| internal/infrastructure/nginx | 指定实例测试/reload、worker 与 HTTP 生效验证 |
+| internal/infrastructure/state | 事务模型的单文件 JSON 持久化 |
+| internal/infrastructure/fsutil | 目录句柄、原子写与受限清理 |
+| internal/infrastructure/git | 允许来源、提交校验、受限归档 |
+| internal/infrastructure/lock / process | 共享锁、子进程期限与进程组 |
+| internal/infrastructure/prom / applog | 有限指标与 JSON 日志 |
+| internal/config | 严格 YAML、参数与目标映射校验 |
+| scripts / Jenkinsfile | 可选客户端：持久化逐节点 HTTP 批次、前端清单工具 |
+
+依赖规则：HTTP 适配器通过 `Publisher` 接口调用用例；应用层处理发布流程并调用基础设施，Nginx 运行环境通过 `Runtime` 接口替换。基础设施负责外部系统操作。领域模型不依赖接口层、应用层、基础设施或配置加载器。配置加载器复用领域目标类型，存储层复用领域事务类型，避免领域对象反向依赖 YAML 或 JSON 文件存储实现。
 
 ## 十六、验收
 
@@ -330,12 +365,14 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | 新前端旧资源/错误 assets 路由 | 旧资源可达；错误映射触发恢复 |
 | 前端缺引用或哈希路径冲突 | 切换前拒绝 |
 | XFF 伪造、未认证标签输入 | 不绕过来源授权，不增加任意业务标签 |
+| JSON 访问日志、401/403/404/500、panic | IP/状态码/耗时正确，令牌/查询参数/异常值不泄漏 |
+| 发布失败、幂等重放、自动恢复失败指标 | 失败计数增一，重放不重计，目标待恢复 Gauge 为 1 |
 | 老服务预检/响应丢失/批次磁盘失败 | 写入前停止、按原 ID 查、持久化失败不 POST |
 | 节点旧版本不同/恢复期间版本改变 | 各自恢复或停止 |
 
 还需在目标环境执行的验收：
 
-1. `NGINX_TEST_BINARY=/实际/nginx go test ./internal/service/runner -run TestRealNginxActivationAndRecovery -v`：专用实例的 reload、新 worker、语法失败恢复、HTTP 不符合预期的恢复。
+1. `NGINX_TEST_BINARY=/实际/nginx go test ./internal/application/publisher -run TestRealNginxActivationAndRecovery -v`：专用实例的 reload、新 worker、语法失败恢复、HTTP 不符合预期的恢复。
 2. 真实站点 include/白名单规则、Host/SNI、文件访问权限与 PID 配置一致性。
 3. 真实前端浏览器旧页面懒加载、CDN/缓存期限、动态资源路径与跨版本路由。
 4. Jenkins 凭据、持久归档和 Copy Artifact 权限；中断后使用原批次文件恢复。

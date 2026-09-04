@@ -1,85 +1,42 @@
-# HTTP 发布协议 2。复制后修改节点、仓库、目录和实际生效验证地址。
-# 旧版字符串 targets、allowed_path_dest_prefixes 等字段不再支持；未知配置字段启动即报错。
-listen_addr: 127.0.0.1:8081
-node_id: nginx-uat-01
+# UTF-8。HTTP 发布服务；已有 Nginx 自动识别，不需要填写 nginx 配置块。
+listen_addr: ":9166"
+# hostname 可省略，默认读取本机主机名；也兼容 node_id。
+# hostname: nginx-uat-01
+# env 可省略，按 release_auth_tokens 中的环境认证；填写后只接受指定环境。
 env: uat
-data_dir: /var/lib/nginx-release
-# 同一台机器、同一 Nginx 实例的所有服务进程必须使用同一个锁文件和 data_dir。
-lock_file: /var/lock/nginx-release.lock
-log_file: ""  # JSON Lines 到 stdout；time/level/message，访问日志含 client_ip/status_code
+data_dir: /data/nginx-updata-config/data
+log_file: /data/wwwlogs/nginx-updata-config-http.log
+
 release_auth_tokens:
   uat: replace-with-uat-release-token
-allowed_client_ips:
-  - 127.0.0.1
-  - ::1
-# 只填写真正受信任的直接反代；客户端地址从 XFF 右侧逐跳解析。
-# trusted_proxy_cidrs: ["127.0.0.1/32"]
-execution_timeout: 5m
-step_timeout: 60s
-recovery_timeout: 90s
-cleanup_timeout: 5s
-max_request_bytes: 65536
-max_concurrent_requests: 64
-max_archive_bytes: 1073741824
-max_archive_files: 100000
-min_free_bytes: 67108864
-keep_releases: 5
-asset_retention: 168h
-nginx:
-  binary: /usr/sbin/nginx
-  config_file: /etc/nginx/nginx.conf
-  prefix: /etc/nginx
-  pid_file: /run/nginx.pid
-# 仅 frontend_static 目标需要 ORAS；登录凭据由运维使用 pull-only Robot 预置。
-oras:
-  binary: /usr/local/bin/oras
-  registry_config: /etc/nginx-release/harbor-auth.json
-  # ca_file: /etc/nginx-release/harbor-ca.pem
+
 repos:
   config:
     url: https://gitlab.example.com/ops/nginx-vhosts.git
-    gitlab_token: replace-with-read-repository-token
-    allowed_branches: [uat]
+    gitlab_token: replace-with-config-read-token
+    # allowed_branches: [uat]  # 可选；不配置则允许仓库任意分支上的提交。
   whitelist:
     url: https://gitlab.example.com/ops/nginx-whitelist.git
-    gitlab_token: replace-with-read-repository-token
-    allowed_branches: [uat]
+    gitlab_token: replace-with-whitelist-read-token
+
+# 本节点接受哪些类型的发布请求（仅区分 type）。
+# path_dest（绝对路径）和 server_name（站点目录键）在 POST JSON 的 params 中传入。
+# project 是可选顶层字段，不参与目录身份。
 targets:
-  - type: config
-    server_name: ybf-uat-nginx
-    path_dest: /data/nginx-publish
-    project: ybf
-    file_mode: "0644"
-    required_files: [site.conf]
-    # 应由被发布配置返回对应版本/真实行为；静态“ok”不能证明新配置已生效。
-    health_checks:
-      - url: http://127.0.0.1:8080/__release
-        host: ybf-uat.example.com
-        status: 200
-        contains: "{commit}"
-    # 首次部署原来无 latest 时，用这些检查确认原入口；已有状态后不用此项。
-    initial_health_checks:
-      - url: http://127.0.0.1:8080/__release
-        host: ybf-uat.example.com
-        status: 404
-  # 为每个实际站点逐条配置；路径须与请求完全对应，不再允许任意子目录。
-  # - type: whitelist
-  #   server_name: ybf-uat-nginx
-  #   path_dest: /data/nginx-publish
-  #   required_files: [allow.conf]
-  #   health_checks:
-  #     - {url: "http://127.0.0.1:8080/protected", host: "ybf-uat.example.com", status: 200, contains: "authorized"}
-  #   initial_health_checks:
-  #     - {url: "http://127.0.0.1:8080/protected", host: "ybf-uat.example.com", status: 403}
-  # - type: frontend_static
-  #   server_name: ybf-uat-web
-  #   path_dest: /var/www
-  #   artifact_repository: harbor.example.com/web/ybf-uat-web-dist
-  #   shared_assets: false
-  #   required_files: [index.html]
-  #   public_base_url: http://127.0.0.1:8080
-  #   public_host: web-uat.example.com
-  #   health_checks:
-  #     - {url: "http://127.0.0.1:8080/.release-version", host: "web-uat.example.com", contains: "{commit}"}
-  #   initial_health_checks:
-  #     - {url: "http://127.0.0.1:8080/", host: "web-uat.example.com", status: 404}
+  - config
+  - whitelist
+  # - frontend_static
+
+# 启用 frontend_static 时配置 ORAS 和 Harbor pull 仓库。
+# {server_name} 替换为请求中的站点目录键；单应用也可填写完整固定仓库名。
+# oras:
+#   binary: /usr/local/bin/oras
+#   registry_config: /etc/nginx-release/harbor-auth.json
+#   repository: harbor.example.com/web/{server_name}-dist
+#   # ca_file: /etc/nginx-release/harbor-ca.pem
+
+# 可选限制实际调用方 IP；留空时由环境 Token 认证。
+# allowed_client_ips: ["192.0.2.10"]
+# 单实例无需 nginx 块；多实例时仅指定已有实例的 pid_file 即可。
+# nginx:
+#   pid_file: /run/nginx-custom.pid

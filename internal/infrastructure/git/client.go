@@ -26,7 +26,7 @@ type Client struct {
 
 func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) (string, string, error) {
 	repo, ok := c.Repos[key]
-	if !ok || !branchAllowed(repo.AllowedBranches, branch) {
+	if !ok || (branch != "" && !branchAllowed(repo.AllowedBranches, branch)) {
 		return "", "", fmt.Errorf("repository or branch not allowed")
 	}
 	if !release.IsCommit(commit) {
@@ -54,8 +54,10 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	}
 	run := func(args ...string) (string, error) { return process.Run(ctx, "", env, secrets, "git", args...) }
 	ref := "refs/heads/" + branch
-	if _, err = run("check-ref-format", ref); err != nil {
-		return "", "", err
+	if branch != "" {
+		if _, err = run("check-ref-format", ref); err != nil {
+			return "", "", err
+		}
 	}
 	if _, err = data.Stat(filepath.Join(repoRel, "HEAD")); errors.Is(err, os.ErrNotExist) {
 		if _, err = run("init", "--bare", repoDir); err != nil {
@@ -64,7 +66,11 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	} else if err != nil {
 		return "", "", err
 	}
-	if _, err = run("--git-dir="+repoDir, "fetch", "--force", "--no-tags", repo.URL, ref+":"+ref); err != nil {
+	refspec := "+" + ref + ":" + ref
+	if branch == "" {
+		refspec = "+refs/heads/*:refs/heads/*"
+	}
+	if _, err = run("--git-dir="+repoDir, "fetch", "--prune", "--force", "--no-tags", repo.URL, refspec); err != nil {
 		return "", "", err
 	}
 	kind, err := run("--git-dir="+repoDir, "cat-file", "-t", commit)
@@ -79,8 +85,26 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	if actual != commit {
 		return "", "", fmt.Errorf("commit did not resolve to exact ID")
 	}
-	if _, err = run("--git-dir="+repoDir, "merge-base", "--is-ancestor", actual, ref); err != nil {
-		return "", "", fmt.Errorf("commit not in requested branch: %w", err)
+	refs := []string{branch}
+	if branch == "" {
+		out, e := run("--git-dir="+repoDir, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/")
+		if e != nil {
+			return "", "", e
+		}
+		refs = strings.Fields(out)
+	}
+	reachable := false
+	for _, name := range refs {
+		if !branchAllowed(repo.AllowedBranches, name) {
+			continue
+		}
+		if _, e := run("--git-dir="+repoDir, "merge-base", "--is-ancestor", actual, "refs/heads/"+name); e == nil {
+			reachable = true
+			break
+		}
+	}
+	if !reachable {
+		return "", "", fmt.Errorf("commit not reachable from an allowed repository branch")
 	}
 	rel := filepath.Join("worktrees", "export-"+release.ID())
 	if err = fsutil.EnsureDirs(data, rel, 0700); err != nil {
@@ -130,6 +154,9 @@ func Extract(ctx context.Context, input io.Reader, dest *os.Root, maxBytes int64
 	return archive.Extract(ctx, input, dest, maxBytes, maxFiles)
 }
 func branchAllowed(allowed []string, branch string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
 	for _, a := range allowed {
 		if a == branch {
 			return true

@@ -1,6 +1,9 @@
 package target
 
 import (
+	"bytes"
+	"fmt"
+	"gopkg.in/yaml.v3"
 	"nginx_updata_config/internal/domain/release"
 	"os"
 	"strconv"
@@ -14,6 +17,8 @@ type HealthCheck struct {
 	Contains      string `yaml:"contains" json:"contains,omitempty"`
 }
 type Target struct {
+	Env                 string              `yaml:"-" json:"env,omitempty"`
+	Dynamic             bool                `yaml:"-" json:"dynamic,omitempty"`
 	ArtifactRepository  string              `yaml:"artifact_repository" json:"artifact_repository,omitempty"`
 	SharedAssets        bool                `yaml:"shared_assets" json:"-"`
 	Type                release.ReleaseType `yaml:"type" json:"type"`
@@ -29,6 +34,28 @@ type Target struct {
 	ID                  string              `yaml:"-" json:"target_id"`
 	Dir                 string              `yaml:"-" json:"deployment_dir"`
 }
+
+// A scalar enables a release type; its site and destination arrive over HTTP.
+func (t *Target) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		t.Type = release.ReleaseType(n.Value)
+		return nil
+	}
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("target must be a release type or mapping")
+	}
+	// Keep unknown-field rejection even when decoding through this custom method.
+	encoded, err := yaml.Marshal(n)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	type plain Target
+	return decoder.Decode((*plain)(t))
+}
+
+func (t Target) IsTemplate() bool { return t.ServerName == "" && t.PathDest == "" }
 
 func (t Target) Mode() os.FileMode {
 	v, _ := strconv.ParseUint(t.FileMode, 8, 32)

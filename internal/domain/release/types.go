@@ -30,6 +30,11 @@ const (
 const FrontendORASCapability = "frontend_oras_v1"
 
 type ApplyRequest struct {
+	CommitAlias           string            `json:"commitid,omitempty"`
+	ServerName            string            `json:"server_name,omitempty"`
+	ServerNameAlias       string            `json:"servee_name,omitempty"`
+	PathDest              string            `json:"path_dest,omitempty"`
+	DataDir               string            `json:"data_dir,omitempty"`
 	ArtifactDigest        string            `json:"artifact_digest,omitempty"`
 	ReleaseID             string            `json:"release_id"`
 	ExpectedStateRevision string            `json:"expected_state_revision"`

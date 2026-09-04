@@ -20,23 +20,49 @@ var sitePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 func IsID(v string) bool     { return uuidPattern.MatchString(v) }
 func IsCommit(v string) bool { return commitPattern.MatchString(v) }
 func ValidateApplyRequest(r *ApplyRequest) error {
+	if r.Params == nil {
+		r.Params = map[string]string{}
+	}
+	merge := func(dest *string, alias string, name string) error {
+		if alias != "" && *dest != "" && alias != *dest {
+			return fieldError(name, "重复字段值不一致")
+		}
+		if *dest == "" {
+			*dest = alias
+		}
+		return nil
+	}
+	if err := merge(&r.CommitID, r.CommitAlias, "commit_id/commitid"); err != nil {
+		return err
+	}
+	for _, field := range []struct{ key, value string }{{"server_name", r.ServerName}, {"server_name", r.ServerNameAlias}, {"path_dest", r.PathDest}} {
+		value := r.Params[field.key]
+		if err := merge(&value, field.value, field.key); err != nil {
+			return err
+		}
+		r.Params[field.key] = value
+	}
+	r.CommitAlias, r.ServerName, r.ServerNameAlias, r.PathDest = "", "", "", ""
+	if r.ReleaseID == "" {
+		r.ReleaseID = ID()
+	}
 	r.Env = strings.TrimSpace(r.Env)
 	r.Branch = strings.TrimSpace(r.Branch)
 	r.Project = strings.TrimSpace(r.Project)
 	r.CommitID = strings.ToLower(strings.TrimSpace(r.CommitID))
 	r.Version = strings.TrimSpace(r.Version)
 	r.ArtifactDigest = strings.TrimSpace(r.ArtifactDigest)
-	if !IsID(r.ReleaseID) || !IsID(r.ExpectedStateRevision) {
+	if !IsID(r.ReleaseID) || (r.ExpectedStateRevision != "" && !IsID(r.ExpectedStateRevision)) {
 		return fieldError("release_id/expected_state_revision", "须为 UUID，要求 HTTP 发布协议 2")
 	}
-	if r.RestoreOf != "" && !IsID(r.RestoreOf) {
+	if r.RestoreOf != "" && (!IsID(r.RestoreOf) || r.ExpectedStateRevision == "") {
 		return fieldError("restore_of", "须为 UUID")
 	}
-	if r.Env == "" || len(r.Env) > 64 || (r.Type != ReleaseTypeFrontendStatic && r.Branch == "") || len(r.Branch) > 255 {
+	if r.Env == "" || len(r.Env) > 64 || len(r.Branch) > 255 {
 		return fieldError("env/branch", "不能为空或超长")
 	}
 	if r.Type == ReleaseTypeFrontendStatic {
-		if !IsArtifactDigest(r.ArtifactDigest) {
+		if r.ArtifactDigest != "" && !IsArtifactDigest(r.ArtifactDigest) {
 			return fieldError("artifact_digest", "前端须指定 sha256 OCI manifest digest")
 		}
 	} else if r.ArtifactDigest != "" {

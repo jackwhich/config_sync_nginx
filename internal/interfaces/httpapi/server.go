@@ -22,7 +22,7 @@ type Publisher interface {
 	Apply(context.Context, release.ApplyRequest) release.Result
 	Health() map[string]any
 	Target(string) (config.Target, bool)
-	Resolve(release.ReleaseType, string, string, string) (config.Target, error)
+	Resolve(release.ReleaseType, string, string, string, ...string) (config.Target, error)
 	State(string, string) (map[string]any, int, error)
 }
 type Server struct {
@@ -114,11 +114,21 @@ func (s *Server) Handler() http.Handler {
 		s.mux.ServeHTTP(cw, r)
 	})
 }
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request, environments ...string) bool {
 	// Authenticate before decoding attacker-controlled JSON or producing target metric labels.
-	expected := strings.TrimSpace(s.cfg.ReleaseAuthTokens[s.cfg.Env])
 	token := r.Header.Get(auth.ReleaseAuthHeader)
-	if expected == "" || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+	env := ""
+	if len(environments) > 0 {
+		env = environments[0]
+	}
+	matched := 0
+	for key, expected := range s.cfg.ReleaseAuthTokens {
+		if !s.cfg.AcceptsEnv(key) || (env != "" && env != key) {
+			continue
+		}
+		matched |= subtle.ConstantTimeCompare([]byte(token), []byte(strings.TrimSpace(expected)))
+	}
+	if token == "" || matched != 1 {
 		writeError(w, 401, "UNAUTHORIZED", "invalid release token")
 		return false
 	}
@@ -153,6 +163,17 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, "INVALID_JSON", err.Error())
 		return
 	}
+	if strings.TrimSpace(req.Env) == "" {
+		writeError(w, 400, "INVALID_REQUEST", "env is required")
+		return
+	}
+	if !s.cfg.AcceptsEnv(strings.TrimSpace(req.Env)) {
+		writeError(w, 403, "ENV_NOT_ALLOWED", "environment not enabled")
+		return
+	}
+	if !s.authorize(w, r, strings.TrimSpace(req.Env)) {
+		return
+	}
 	result := s.runner.Apply(r.Context(), req)
 	if cw, ok := w.(*captureWriter); ok {
 		if release.IsID(result.ReleaseID) {
@@ -171,8 +192,11 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if q.Get("env") != s.cfg.Env {
+	if !s.cfg.AcceptsEnv(q.Get("env")) {
 		writeError(w, 403, "ENV_NOT_ALLOWED", "environment does not match this node")
+		return
+	}
+	if !s.authorize(w, r, q.Get("env")) {
 		return
 	}
 	id := q.Get("target_id")
@@ -191,7 +215,7 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		t, ok := s.runner.Target(id)
-		if !ok || (t.Project != "" && q.Get("project") != "" && q.Get("project") != t.Project) {
+		if !ok || t.Env != q.Get("env") || (t.Project != "" && q.Get("project") != "" && q.Get("project") != t.Project) {
 			writeError(w, 403, "TARGET_NOT_ALLOWED", "target not authorized")
 			return
 		}
@@ -200,7 +224,7 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "INVALID_REQUEST", "type, server_name and path_dest required")
 			return
 		}
-		t, e := s.runner.Resolve(release.ReleaseType(q.Get("type")), q.Get("server_name"), q.Get("path_dest"), q.Get("project"))
+		t, e := s.runner.Resolve(release.ReleaseType(q.Get("type")), q.Get("server_name"), q.Get("path_dest"), q.Get("project"), q.Get("env"))
 		if e != nil {
 			writeError(w, 403, "TARGET_NOT_ALLOWED", e.Error())
 			return

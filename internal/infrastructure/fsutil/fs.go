@@ -153,7 +153,7 @@ func (r *contextReader) Read(p []byte) (int, error) {
 }
 func Reader(ctx context.Context, r io.Reader) io.Reader { return &contextReader{ctx, r} }
 func Switch(r *os.Root, target string) error {
-	if target != "" && (!fs.ValidPath(target) || !strings.HasPrefix(target, "releases/")) {
+	if target != "" && (!fs.ValidPath(target) || (!strings.HasPrefix(target, "releases/") && !release.IsCommit(target))) {
 		return fmt.Errorf("unsafe link target %q", target)
 	}
 	if target == "" {

@@ -30,6 +30,11 @@ nginx:
   config_file: /etc/nginx/nginx.conf
   prefix: /etc/nginx
   pid_file: /run/nginx.pid
+# 仅 frontend_static 目标需要 ORAS；登录凭据由运维使用 pull-only Robot 预置。
+oras:
+  binary: /usr/local/bin/oras
+  registry_config: /etc/nginx-release/harbor-auth.json
+  # ca_file: /etc/nginx-release/harbor-ca.pem
 repos:
   config:
     url: https://gitlab.example.com/ops/nginx-vhosts.git
@@ -37,10 +42,6 @@ repos:
     allowed_branches: [uat]
   whitelist:
     url: https://gitlab.example.com/ops/nginx-whitelist.git
-    gitlab_token: replace-with-read-repository-token
-    allowed_branches: [uat]
-  frontend_static:
-    url: https://gitlab.example.com/ops/frontend-artifacts.git
     gitlab_token: replace-with-read-repository-token
     allowed_branches: [uat]
 targets:
@@ -72,7 +73,9 @@ targets:
   #     - {url: "http://127.0.0.1:8080/protected", host: "ybf-uat.example.com", status: 403}
   # - type: frontend_static
   #   server_name: ybf-uat-web
-  #   path_dest: /data/nginx-publish
+  #   path_dest: /var/www
+  #   artifact_repository: harbor.example.com/web/ybf-uat-web-dist
+  #   shared_assets: false
   #   required_files: [index.html]
   #   public_base_url: http://127.0.0.1:8080
   #   public_host: web-uat.example.com

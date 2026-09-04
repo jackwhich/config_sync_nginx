@@ -1,0 +1,50 @@
+# HTTP 发布协议 2。复制后修改节点、仓库、目录和实际生效验证地址。
+# 旧版字符串 targets、allowed_path_dest_prefixes 等字段不再支持；未知配置字段启动即报错。
+listen_addr: 127.0.0.1:8081
+node_id: nginx-uat-01
+env: uat
+data_dir: /var/lib/nginx-release
+# 同一台机器、同一 Nginx 实例的所有服务进程必须使用同一个锁文件和 data_dir。
+lock_file: /var/lock/nginx-release.lock
+log_file: ""  # JSON Lines 到 stdout；time/level/message，访问日志含 client_ip/status_code
+release_auth_tokens:
+  uat: replace-with-uat-release-token
+allowed_client_ips:
+  - 127.0.0.1
+  - ::1
+# 只填写真正受信任的直接反代；客户端地址从 XFF 右侧逐跳解析。
+# trusted_proxy_cidrs: ["127.0.0.1/32"]
+execution_timeout: 5m
+step_timeout: 60s
+recovery_timeout: 90s
+cleanup_timeout: 5s
+max_request_bytes: 65536
+max_concurrent_requests: 64
+max_archive_bytes: 1073741824
+max_archive_files: 100000
+min_free_bytes: 67108864
+keep_releases: 5
+asset_retention: 168h
+nginx:
+  binary: /usr/sbin/nginx
+  config_file: /etc/nginx/nginx.conf
+  prefix: /etc/nginx
+  pid_file: /run/nginx.pid
+# 仅 frontend_static 目标需要 ORAS；登录凭据由运维使用 pull-only Robot 预置。
+oras:
+  binary: /usr/local/bin/oras
+  registry_config: /etc/nginx-release/harbor-auth.json
+  # ca_file: /etc/nginx-release/harbor-ca.pem
+targets:
+  - type: frontend_static
+    server_name: app
+    path_dest: /var/www
+    artifact_repository: harbor.example.com/web/app-dist
+    shared_assets: false
+    required_files: [index.html]
+    public_base_url: http://127.0.0.1:8080
+    public_host: app.example.com
+    health_checks:
+      - {url: "http://127.0.0.1:8080/.release-version", host: "app.example.com", contains: "{commit}"}
+    initial_health_checks:
+      - {url: "http://127.0.0.1:8080/", host: "app.example.com", status: 404}

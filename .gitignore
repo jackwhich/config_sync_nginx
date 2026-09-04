@@ -13,3 +13,4 @@ configs/service.local.yaml
 release-batch*.json
 release-batch*.json.lock
 http-release-*/
+artifact-bundle/

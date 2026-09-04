@@ -19,11 +19,12 @@ dist-linux-amd64:
 dist-linux-arm64:
 	$(MAKE) _dist ARCH=arm64
 _dist:
-	mkdir -p $(PKG_ROOT)/bin $(PKG_ROOT)/configs $(PKG_ROOT)/scripts $(PKG_ROOT)/deploy
+	mkdir -p $(PKG_ROOT)/bin $(PKG_ROOT)/configs $(PKG_ROOT)/scripts $(PKG_ROOT)/deploy $(PKG_ROOT)/docs
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) $(GO) build -trimpath -ldflags '-s -w -X main.version=$(VERSION)' -o $(PKG_ROOT)/bin/$(BINARY) ./cmd/nginx_updata_config
-	cp configs/service.example.yaml configs/frontend-location.example.conf configs/prometheus-*.yml $(PKG_ROOT)/configs/
-	cp scripts/release-apply.sh scripts/release_http.py scripts/frontend-manifest.py $(PKG_ROOT)/scripts/
+	cp configs/service.example.yaml configs/frontend-service.example.yaml configs/frontend-location.example.conf configs/prometheus-*.yml $(PKG_ROOT)/configs/
+	cp scripts/release-apply.sh scripts/release_http.py scripts/frontend-manifest.py scripts/frontend-artifact.sh $(PKG_ROOT)/scripts/
 	cp deploy/nginx-updata-config.service $(PKG_ROOT)/deploy/
+	cp docs/frontend-oras.md $(PKG_ROOT)/docs/
 	cp README.md edge-sync-agent-design-v3.md $(PKG_ROOT)/
 	printf '%s\n' 'HTTP release contract 2 — $(VERSION) linux/$(ARCH)' > $(PKG_ROOT)/VERSION
 	tar -C $(DIST_DIR) -czf $(DIST_DIR)/$(PKG_NAME).tar.gz $(PKG_NAME)

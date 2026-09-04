@@ -1,6 +1,6 @@
 # Nginx HTTP 发布服务
 
-Jenkins 或脚本通过 HTTP 同步调用每台节点。服务从配置允许的 Git 仓库提取指定站点和完整提交，生成不可变快照，切换 `latest`，验证 Nginx 生效后原子提交状态。失败时用本节点发布前快照恢复。
+Jenkins 或脚本通过 HTTP 同步调用每台节点。配置/白名单从允许的 Git 仓库提取，前端通过 ORAS 从 Harbor 拉取固定 digest 的 dist.tar.gz，生成不可变快照，切换 `latest`，验证 Nginx 生效后原子提交状态。失败时用本节点发布前快照恢复。
 
 当前代码采用 HTTP 发布协议 2。旧 `internal/agent` 入口已移除，实现按接口、应用、领域、基础设施分层。不使用拉取任务、注册、心跳上报或 desired_state。设计说明见 [HTTP 设计文档](edge-sync-agent-design-v3.md)（沿用原文件名便于追踪）。
 
@@ -18,7 +18,8 @@ internal/
     auth/                    # 认证协议常量
   infrastructure/
     nginx/                   # Nginx 进程与实际 HTTP 生效检查
-    git/                     # Git 来源、导出与解包
+    git/                     # 配置/白名单的 Git 来源与导出
+    oras/ archive/           # 前端 OCI 拉取与统一安全解包
     state/                   # 事务 JSON 持久化
     fsutil/ lock/ process/   # 文件、锁和子进程
     applog/ prom/            # JSON 日志和 Prometheus 指标
@@ -29,11 +30,11 @@ configs/                     # 服务、监控与告警配置示例
 
 HTTP 层依赖 `Publisher` 接口；应用层编排领域对象和基础设施操作，Nginx 操作通过 `Runtime` 接口调用。领域层不依赖 HTTP、配置加载器或基础设施；磁盘存储实现与事务模型分离。配置模块负责把 YAML 转为已验证的参数。
 
-Python 只承担两项辅助工作：`release_http.py` 持久保存多节点请求和恢复进度，`frontend-manifest.py` 为已构建的前端资源生成摘要清单。HTTP 协议本身不绑定 Python，Go 服务不会启动这些脚本。当前保留这些可选工具，避免在客户端实现尚未替换时丢失断线续传与逐节点恢复能力。
+Python 只承担两项辅助工作：`release_http.py` 持久保存多节点请求和恢复进度，`frontend-manifest.py` 仅为可选 shared_assets 模式生成哈希资源清单。普通 ORAS dist 包不需要该清单或 Python。HTTP 协议本身不绑定 Python，Go 服务不会启动这些脚本。当前保留这些可选工具，避免在客户端实现尚未替换时丢失断线续传与逐节点恢复能力。
 
 ## 构建与启动
 
-运行依赖：Linux、Git、已安装的 Nginx；构建需要 Go 1.25+。节点服务不需要 Python。可选批量客户端和前端清单工具需要 Python 3.9+，也可以由 Jenkins 或其他语言直接调用 HTTP 接口。使用 Linux 本地文件系统保存状态、锁和快照。
+运行依赖：Linux、已安装的 Nginx；Git 发布类型需要 Git，前端需要独立 ORAS 1.3.x；构建需要 Go 1.25+。节点服务不需要 Python。可选批量客户端和前端清单工具需要 Python 3.9+，也可以由 Jenkins 或其他语言直接调用 HTTP 接口。使用 Linux 本地文件系统保存状态、锁和快照。
 
 ```bash
 go test ./...
@@ -57,7 +58,7 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
 
 ## 仓库与目录
 
-仓库根下按站点保存制品：
+配置和白名单的 Git 仓库根下按站点保存制品：
 
 ```text
 <repo>/
@@ -65,7 +66,7 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
     site.conf
 ```
 
-落盘布局：
+配置和白名单落盘布局：
 
 ```text
 <path_dest>/<type>/<server_name>/
@@ -75,13 +76,12 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
   releases/<完整 commit>/
     site.conf
     .release-version
-  assets/                       # 仅前端类型，跨版本共享
   latest -> releases/<完整 commit>
 ```
 
 Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。
 
-提交必须是允许分支可达的完整 40/64 位 ID。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
+Git 类型的提交必须是允许分支可达的完整 40/64 位 ID。前端使用完整 Git SHA 加 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 
 ## HTTP 接口
 
@@ -96,7 +96,7 @@ Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 
 
 apply/state 使用 `X-Release-Token`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
 
-先检查 `/healthz`：`release_contract` 必须等于 2，`publish_ready` 必须为 true。老服务缺少该字段时客户端停止。再查询目标并保存 `target_id`、`state_revision`：
+先检查 `/healthz`：`release_contract` 必须等于 2，`publish_ready` 必须为 true。前端还要求 `capabilities` 包含 `frontend_oras_v1`。老服务缺少该字段时客户端停止。再查询目标并保存 `target_id`、`state_revision`：
 
 ```bash
 curl --get "$RELEASE_URL/api/v1/releases/state" \
@@ -159,19 +159,29 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 保存批次文件到持久存储，文件内没有令牌。Jenkins 示例会归档该文件，resume/rollback 用 `SOURCE_BUILD` 读取原构建记录，需要 **Copy Artifact** 插件。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
 
-## 前端静态资源
+## 前端 ORAS 制品发布
 
-前端仓库需包含 `index.html`、`assets/` 中带十六进制哈希名的资源和 `frontend-manifest.json`。可在提交制品前生成清单：
+前端使用 Harbor OCI 文件制品，主机无需 Docker。完整方案、命令和回滚约束见 [ORAS 前端设计](docs/frontend-oras.md)。目录按本次约定：
 
-```bash
-python3 scripts/frontend-manifest.py path/to/ybf-uat-web
+```text
+<path_dest>/<server_name>/
+  <完整SHA>/index.html
+  <完整SHA>/assets/...
+  latest -> <完整SHA>
 ```
 
-资源名示例 `assets/app.89abcdef.js`；清单存储文件 SHA-256。除 index 和清单外，所有制品必须列为哈希资源。当前静态引用检查覆盖 HTML src/href、CSS url、常见 JS import/URL 写法；运行期拼接的 URL 需要构建规范保证，不能靠源码正则证明完整性。
+例如 `/var/www/app/<完整SHA>`，Nginx root 为 `/var/www/app/latest`。latest 与 SHA 目录同级，不使用 releases/current。
 
-采用 [前端 Nginx 路由示例](configs/frontend-location.example.conf)，让 `/assets/` 指向站点的共享 assets 目录，让 HTML 和版本探针不缓存。配置 `public_base_url` 和必要的 `public_host`，服务将验证新版本全部制品的 HTTP 摘要及保留版本的旧资源可达性。
+- CI 先 npm build，再用 `bash scripts/frontend-artifact.sh push dist ../artifact-bundle` 打包并经 HTTPS_PROXY 推送 SHA tag。脚本生成 `artifact.digest`，不更新 prod。
+- 前端 HTTP 请求必须含 `artifact_digest: sha256:<64位摘要>`；仓库只从目标的 `artifact_repository` 配置读取。branch 可省略，前端不访问 Git。
+- 服务按 `repository@digest` 拉取，验证 OCI revision、tar 文件摘要和安全解包后，原子 rename 替换 latest。执行指定 Nginx 的 -t、reload、worker 和 HTTP 验证；失败仅用本地基线恢复。
+- 所有节点确认成功后，CI 用 `oras tag "$HARBOR_REPOSITORY@$RELEASE_ARTIFACT_DIGEST" prod` 更新展示标签。
 
-`asset_retention` 必须覆盖客户端存活、缓存和懒加载窗口。清理保护当前、上一版本、运行中候选/基线及前端兼容窗口，至少保留 `keep_releases` 个最近创建快照。清理失败只返回 warnings；不撤销已确认的成功。
+配置见 [前端服务示例](configs/frontend-service.example.yaml) 和 [Nginx root 示例](configs/frontend-location.example.conf)。云主机 ORAS 子进程清空代理；pull-only Robot 凭据保存在独立 registry_config 文件，使用 --password-stdin 登录。
+
+普通 dist 模式 `shared_assets: false` 只要求根目录有非空 index.html，允许 app.js、favicon.ico 等普通资源，不再要求 Python 清单工具。服务仍检查发现的本地静态引用。旧页面懒加载兼容需另外启用 `shared_assets: true`、共享 /assets 路由和哈希资源清单；旧 SHA 目录留在磁盘不会自动保证旧 URL 可达。
+
+批量客户端仍支持 update/resume/rollback。前端额外设置 `RELEASE_ARTIFACT_DIGEST`；恢复时从每节点原始基线读取自己的 digest，不重新拉取 Harbor。
 
 ## JSON 日志与告警
 
@@ -194,7 +204,7 @@ python3 scripts/frontend-manifest.py path/to/ybf-uat-web
 | NginxHTTPReleaseFailed | 10 分钟内发布失败 |
 | NginxHTTPReleaseUnavailable | Prometheus 连续 2 分钟抓取失败 |
 | NginxHTTPReleaseNeedsRecovery | 发布不可用持续 1 分钟 |
-| NginxHTTPReleaseStepFailed | 10 分钟内任一发布步骤失败，可按 step 定位 Git、校验、reload 等 |
+| NginxHTTPReleaseStepFailed | 10 分钟内任一发布步骤失败，可按 step 定位 Git、oras_pull、校验、reload 等 |
 | NginxHTTPReleaseRollbackFailed | 10 分钟内本地自动恢复失败 |
 | NginxHTTPReleaseStateWriteFailed | 10 分钟内权威状态写入失败 |
 | NginxHTTPReleaseCleanupFailed | 10 分钟内快照或导出目录清理失败 |
@@ -227,7 +237,7 @@ nginx_updata_config -config /etc/nginx-release/service.yaml \
 
 导入逐文件比对允许仓库的指定提交，建立新清单和本地基线后持久化切换意图，执行切换、Nginx 校验、reload 和 HTTP 验证。保留旧目录。中断后由新服务启动恢复。文件不匹配、存在未完成发布或链接不属于本目标时拒绝导入。
 
-前端旧布局需先适配共享资源路由；当前导入命令不自动转换旧前端。请在新空目标完成制品发布与路由验证，再按站点变更流程切换入口。`node_id/data_dir/lock_file` 归属已建立后不应随意更换或手工删除标记。
+旧 Git 前端目录和状态不自动转换为 ORAS 布局；先在新空 `<path_dest>/<server_name>` 目录验收，再明确切换 Nginx root。请在新空目标完成制品发布与路由验证，再按站点变更流程切换入口。`node_id/data_dir/lock_file` 归属已建立后不应随意更换或手工删除标记。
 
 本轮改造前代码和旧发布包备份在 `/private/tmp/nginx-before-http-vzttmqfe`，临时目录不适合长期备份，请按团队要求归档。
 

@@ -6,7 +6,7 @@
 
 ## 一、目标与边界
 
-Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类型、站点、发布目录、分支及完整提交。节点从配置允许的 Git 仓库获取制品，处理本机文件、指定 Nginx 实例和本地状态。
+Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类型、站点、发布目录、分支及完整提交。配置/白名单从允许的 Git 仓库获取制品，前端通过 ORAS 拉取 Harbor 上固定 digest 的 dist.tar.gz，处理本机文件、指定 Nginx 实例和本地状态。
 
 单次请求同步执行并返回最终结果。收到运行中冲突时调用方查询原记录，不创建后台任务队列。节点不可达时结果视为未知，批次停止推进。
 
@@ -16,7 +16,7 @@ Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类
 | --- | --- | --- |
 | config | Nginx 配置 | 原子切换、指定实例 nginx -t/reload、新 worker 与 HTTP 检查 |
 | whitelist | Nginx 引用的白名单 | 同上，并配置实际放行/拒绝行为检查 |
-| frontend_static | 构建完成的 index 与哈希资源 | 原子切换入口，验证新制品摘要与旧资源可达性 |
+| frontend_static | Harbor OCI 中的 dist.tar.gz | 原子 latest 切换、指定 Nginx 测试/reload/worker 与 HTTP 摘要校验 |
 
 前端不执行构建，不自动修改 Nginx 路由。配置和白名单的 include 位置由运维预先配置，服务不会猜测主配置。
 
@@ -25,7 +25,8 @@ Jenkins/命令行调用各节点的 HTTP 发布服务，显式提供环境、类
 ```mermaid
 flowchart LR
     CI[Jenkins / HTTP 批量客户端] -->|预检、查询、同步 apply| S[节点 HTTP 发布服务]
-    S -->|允许分支、固定完整提交| G[Git 仓库]
+    S -->|配置/白名单：允许分支、固定提交| G[Git 仓库]
+    S -->|前端：oras pull 固定 digest| H[Harbor OCI dist.tar.gz]
     S --> L[节点共享互斥锁]
     S --> D[不可变快照与 latest]
     S --> N[指定 Nginx 实例 / HTTP 验证]
@@ -39,7 +40,7 @@ flowchart LR
 
 - 环境以服务配置为准，请求不得跨环境。
 - 目标由配置中的 `type + server_name + path_dest` 明确列举。
-- path_dest 规范化为真实绝对根目录，部署目录为 `<root>/<type>/<site>`。
+- path_dest 规范化为真实绝对根目录。配置/白名单目录为 `<root>/<type>/<site>`；前端为 `<root>/<server_name>`，内部 `<完整SHA>` 与 `latest` 同级。
 - `target_id = SHA256(JSON([env, deployment_dir]))`；同目录同环境得到相同身份，project 不参与身份。
 - project 是可选约束/元数据。配置指定 project 时，省略会补为配置值，显式不一致拒绝。
 - 节点有稳定 node_id。目标 `.publisher.json` 绑定 node_id、env、data_dir 和 lock_file，防止两套独立状态/锁接管同一目录。
@@ -52,9 +53,9 @@ Git URL 和凭据只来自服务配置。远端要求 HTTPS，无 URL 内嵌凭�
 
 完整示例位于 `configs/service.example.yaml`。未知 YAML 字段、旧字符串 targets、缺失的必填项启动即报错。
 
-必填：listen_addr、node_id、env、data_dir、lock_file、本环境 Token、targets、被使用类型的 repos 与非空 allowed_branches。
+必填：listen_addr、node_id、env、data_dir、lock_file、本环境 Token、targets。Git 类型要求 repos 与非空 allowed_branches；前端要求 oras.binary/registry_config 绝对路径和每个目标的 artifact_repository 白名单。
 
-config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应同一个实例。binary、config_file、pid_file 必须为绝对路径。
+三种类型均要求 Nginx binary/config_file/prefix/pid_file 正确对应同一个实例。binary、config_file、pid_file 必须为绝对路径。
 
 每个目标至少有一条带内容断言的 health_checks，可设置 URL、Host、TLS server name、HTTP 状态及 contains。`{commit}` 可用于 URL/contains，运行时替换。首次无 latest 时使用单独的 initial_health_checks；无可验证基线不能假定恢复成功。
 
@@ -71,7 +72,7 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
 | max_archive_bytes / max_archive_files | 1 GiB / 100000 |
 | min_free_bytes | 64 MiB |
 | keep_releases | 5，最少 2 |
-| asset_retention | 前端必须显式设置正值；示例为 7 天 |
+| asset_retention | 前端 shared_assets=true 时必须为正值；示例为 7 天 |
 
 目录不能重叠或覆盖数据目录；部署目录内不能放锁文件。服务拥有发布目录，Nginx worker 只需读取。文件默认 0644，目录 0755；状态、清单和归属文件限制读取。操作系统应保证本地文件系统的原子 rename 与 fsync 语义。
 
@@ -87,7 +88,7 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
 {"status":"ok","release_contract":2,"node_id":"nginx-uat-01","env":"uat","publish_ready":true,"busy":false,"reason":""}
 ```
 
-客户端在任何写入前检查全部目标节点。协议字段缺失或非 2、节点身份重复、环境不符、待恢复时停止。ready 表示发布执行器可接收工作，不是完整业务健康证明；busy 可能随时变化，最终以发布锁为准。
+前端额外要求 capabilities 包含 `frontend_oras_v1`，缺失时拒绝发送 ORAS 发布请求。客户端在任何写入前检查全部目标节点。协议字段缺失或非 2、节点身份重复、环境不符、待恢复时停止。ready 表示发布执行器可接收工作，不是完整业务健康证明；busy 可能随时变化，最终以发布锁为准。
 
 ### 5.2 发布请求
 
@@ -98,7 +99,8 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
 | release_id | 本次逻辑操作 UUID，重试不得更换 |
 | expected_state_revision | 查询得到的目标修订号 UUID |
 | env / type | 本节点环境及允许的三种类型 |
-| branch | 允许分支；服务验证 Git ref 格式 |
+| branch | Git 类型必填允许分支；前端可省略，不访问 Git |
+| artifact_digest | 前端必填 sha256 OCI manifest digest；Git 类型禁止传入 |
 | commit_id | 完整 40/64 位十六进制提交 ID |
 | params.server_name | 安全的单段站点名，禁止路径穿越与保留名称 |
 | params.path_dest | 与授权目标匹配的绝对根路径 |
@@ -109,7 +111,7 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
 
 ### 5.3 幂等和并发结果
 
-同一 node 范围内 release_id 唯一，绑定规范化请求、target_id 和配置仓库 URL 的摘要。相同 ID 不同参数返回 `409 RELEASE_ID_CONFLICT`。同参数运行中返回 409，终态重放原记录并标记 replayed，待恢复返回 503。
+同一 node 范围内 release_id 唯一，绑定规范化请求、target_id 和配置来源的摘要；前端来源为 artifact_repository@artifact_digest。相同 ID 不同参数返回 `409 RELEASE_ID_CONFLICT`。同参数运行中返回 409，终态重放原记录并标记 replayed，待恢复返回 503。
 
 一个节点所有目标共享进程内互斥及 flock。锁覆盖接受记录、Git 缓存、快照准备、切换、Nginx 操作、状态提交与清理。其他进程启动恢复也必须持锁，禁止在另一发布进行中推断它已崩溃。
 
@@ -142,12 +144,12 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
 2. 检查重复 ID；取得节点锁后重新读取权威状态、检查重复 ID 和 expected revision。
 3. 持久化 running 接受记录。
 4. 比对真实 latest 与状态基线，验证基线快照及实际入口。相同提交也必须执行这些检查才能 skipped。
-5. 正常发布 fetch 允许分支，确认目标对象确为 commit、解析为所给完整 ID，确认提交对该分支可达。按站点执行 git archive。
+5. Git 类型 fetch 允许分支，验证完整提交及分支可达性后 git archive。前端验证固定 OCI manifest digest、Git revision annotation 和有限 layer，再 oras pull 到随机目录、核验文件 SHA-256、安全解包 dist.tar.gz。
 6. 受限解包，复制到随机 staging，验证必需文件、内容摘要、文件模式和可用磁盘，生成 .release-version 与清单。
-7. 复用或创建不可变 releases 快照；前端安装不覆盖已有内容的共享哈希资源。
+7. 复用或创建不可变快照。前端使用 `<server_name>/<完整SHA>`，其他类型使用 releases/<SHA>；仅 shared_assets=true 时安装共享哈希资源。同一 SHA 的既有快照来源摘要不同会拒绝。
 8. 再次确认 latest 未被外部修改，持久化候选、发布前链接、完整本地基线和 switch_intent。
 9. 切换阶段使用独立于 HTTP 客户端的执行上下文，原子替换 latest。
-10. config/whitelist 执行指定实例的 nginx -t、reload，并验证新 worker 和配置的 HTTP 行为；前端校验公开 HTTP 摘要与旧资源。
+10. 所有类型执行指定实例 nginx -t、reload、新 worker 与 HTTP 行为验证；前端额外校验公开文件摘要，shared_assets=true 时再校验旧资源。
 11. 一次原子状态写入同时提交 current、previous、新 revision、请求 succeeded 及最终结果。
 12. 清理历史版本，清理失败记录 warnings。
 
@@ -165,23 +167,36 @@ config/whitelist 还要求 Nginx binary/config_file/prefix/pid_file 正确对应
   .staging/stage-<随机 UUID>/
   releases/<完整 commit>/
   .manifests/<完整 commit>.json
-  assets/
   latest -> releases/<完整 commit>
 ```
 
-文件操作使用目录句柄约束（Go os.Root），解包和目录创建拒绝符号链接、硬链接、绝对路径、路径穿越、非普通文件和 `.git` 内容。临时目录和临时软链使用随机 ID，绝不使用 version。
+上述布局仅用于配置/白名单；前端见 7.2 节。文件操作使用目录句柄约束（Go os.Root），解包和目录创建拒绝符号链接、硬链接、绝对路径、路径穿越、非普通文件和 `.git` 内容。临时目录和临时软链使用随机 ID，绝不使用 version。
 
 清单保存提交、来源、文件 SHA-256 与大小。复用时校验完整文件集合和摘要，不能只凭目录存在判断成功。既有快照缺清单、内容漂移或无可信旧状态时明确失败/待恢复，禁止覆盖正在使用的目录。
 
-### 7.2 前端资源
+### 7.2 前端 ORAS 制品
 
-每个站点包含 index.html、带十六进制哈希文件名的 assets 和 frontend-manifest.json。清单声明所有制品的资源 SHA-256。除 index 外，所有文件均须是已声明的哈希资源；服务生成的版本探针除外。
+采用 [前端 ORAS 专项设计](docs/frontend-oras.md)，CI 经 HTTPS 代理向 Harbor 推送 dist.tar.gz，主机独立 ORAS 二进制按 digest 拉取，无 Docker daemon。前端目录固定为：
 
-服务静态检查 HTML/CSS/常见 JS 引用，拒绝发现的缺失资源；动态拼接地址无法靠正则完备分析，需要构建规范和浏览器验收补充。发布前不将“存在 index.html”当成完整资源校验。
+```text
+<path_dest>/<server_name>/
+  <完整SHA>/index.html
+  <完整SHA>/assets/...
+  latest -> <完整SHA>
+  .publisher.json
+  .staging/
+  .manifests/<完整SHA>.json
+```
 
-assets 必须独立于 latest 映射，同名哈希路径已有不同内容时拒绝覆盖。发布后通过 public_base_url 校验新制品实际 HTTP 内容，并请求保留版本的旧资源，检测错误的 latest/assets 路由。
+latest 与完整 SHA 目录同级，不使用 releases/current。OCI artifact type 为 application/vnd.nginx.frontend.dist.v1，manifest revision annotation 必须等于请求完整 SHA。必须含名为 dist.tar.gz 的 application/gzip layer；可选 dist.tar.gz.sha256 和 manifest.json。机器按 repository@digest 拉取，prod 只给人看。
 
-HTML/探针不缓存；资源可使用不可变缓存。asset_retention 至少覆盖客户端/懒加载兼容窗口，有限保留无法支持无限期不刷新的旧页面。
+拉取前验证 manifest 的自身摘要、版本标注、layer 文件名、类型及声明大小；拉取后再次验证各文件摘要与大小。解包拒绝路径穿越、软硬链接、特殊文件、重复文件及超限输入，验证 gzip 校验和；包根必须有非空 index.html。不会在未完整校验时切换 latest。服务生成内部快照文件清单与 .release-version 探针。
+
+默认 shared_assets=false，支持普通 dist 中的 JS/CSS/favicon 等文件，不强制前端资源哈希名或 Python 生成清单。静态引用检查用于发现缺失资源，但不能完整分析动态构造的 URL。切换后旧页面再次加载旧资源可能 404；仅保留旧 SHA 目录不会自动兼容旧页面。
+
+需要旧页面兼容时可显式启用 shared_assets=true，继续要求 frontend-manifest.json、assets 哈希名、同名内容一致以及独立于 latest 的 /assets 路由。服务安装/保留共享资源，验证新制品及兼容窗口内旧资源；asset_retention 须覆盖旧页面寿命。
+
+CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifest 的 digest；全节点发布确认后才 `oras tag <repository>@<digest> prod`，并串行化应用批次。节点使用 pull-only Robot 的独立 registry_config，清空 CI 代理，验证 TLS，不能通过请求更换仓库/凭据。详见专项设计中的命令、权限和迁移要求。
 
 ## 八、权威状态和启动恢复
 
@@ -210,7 +225,7 @@ HTML/探针不缓存；资源可使用不可变缓存。asset_retention 至少�
 
 正常人工发布旧提交可发新的 apply。撤销指定批次操作则发新 release_id，restore_of 引用同目标、同环境的一次 succeeded：
 
-- 请求 commit 必须等于原记录的本地基线提交。
+- 请求 commit 必须等于原记录的本地基线提交；前端 artifact_digest 也必须等于原基线记录的摘要。
 - expected revision 必须同时等于当前 revision 与原成功操作的 after revision。
 - 当前版本必须仍是原操作候选。
 - 基线必须存在且完整；恢复直接使用本地快照。
@@ -221,11 +236,11 @@ HTML/探针不缓存；资源可使用不可变缓存。asset_retention 至少�
 
 节点 HTTP 服务全由 Go 实现，运行时不依赖 Python，也不会启动 Python 子进程。HTTP 协议与调用语言无关。
 
-当前 `scripts/release_http.py` 是可选批量客户端，使用 Python 标准库；shell 文件是入口。保留 Python 的原因是该工具实现了逐节点批次落盘、未知结果查询和安全恢复，而不是服务端还存在 Agent。`scripts/frontend-manifest.py` 是构建后的制品清单工具，同样不在节点服务运行路径中。只需直接 HTTP 调用时，可以使用 curl、Jenkins 或其他语言；采用自建客户端仍需遵守以下持久化与恢复约束。
+当前 `scripts/release_http.py` 是可选批量客户端，使用 Python 标准库；shell 文件是入口。保留 Python 的原因是该工具实现了逐节点批次落盘、未知结果查询和安全恢复，而不是服务端还存在 Agent。`scripts/frontend-manifest.py` 只用于可选 shared_assets 模式；普通 ORAS dist 使用 shell 打包推送，不需要这个 Python 工具。只需直接 HTTP 调用时，可以使用 curl、Jenkins 或其他语言；采用自建客户端仍需遵守以下持久化与恢复约束。
 
-客户端配置 RELEASE_URLS、ENV、TYPE、BRANCH、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token。
+客户端配置 RELEASE_URLS、ENV、TYPE、COMMIT、PATH_DEST、SERVER_NAME、可选 PROJECT 及环境 Token；Git 类型提供 BRANCH，前端提供 RELEASE_ARTIFACT_DIGEST。新前端预检还要求 frontend_oras_v1 能力。
 
-新批次先预检全部节点、确认 node_id 不重复，再把每个节点 target_id、baseline、revision、原 UUID 和完整请求原子写到批次文件。持久化成功后才发送 HTTP。
+新批次先预检全部节点、确认 node_id 不重复，再把每个节点 target_id、baseline（前端含原 artifact_digest）、revision、原 UUID 和完整请求原子写到批次文件。持久化成功后才发送 HTTP。
 
 逐节点执行，首个失败停止。默认 stop；可在开始前选择 restore，要求所有节点有旧基线。发生未知结果先按原 ID 查询，确认前不对任何节点启动回滚。重试使用原 ID/原参数。
 
@@ -265,7 +280,7 @@ HTTP 访问日志 event=http_access：`request_id`、`node_id`、`env`、`client
 | release_started_timestamp_seconds | Gauge，env/release_type/target_id | 当前事务开始时间，空闲为 0 |
 | last_success_timestamp_seconds | Gauge，env/release_type/target_id | 当前持久版本验证时间，无版本为 0 |
 
-commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签。未授权/无效请求只影响有限的 HTTP 计数。目标和阶段计数器在启动时建立零值，阶段来自固定枚举。恢复标记及当前版本验证时间在 health/metrics 请求时从状态视图刷新，重启后仍可观测；Counter 统计本进程事件，应使用 rate/increase 处理重启。
+commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签。未授权/无效请求只影响有限的 HTTP 计数。目标和阶段计数器在启动时建立零值，阶段来自固定枚举（前端为 oras_pull）。恢复标记及当前版本验证时间在 health/metrics 请求时从状态视图刷新，重启后仍可观测；Counter 统计本进程事件，应使用 rate/increase 处理重启。
 
 ### 11.3 告警接入
 
@@ -275,13 +290,13 @@ commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签
 
 ## 十二、部署和迁移
 
-构建要求 Go 1.25+，运行建议 Linux；Git 必须可用。节点启动不会主动安装 Nginx。
+构建要求 Go 1.25+，运行建议 Linux；Git 类型需要 Git，前端需要 ORAS 1.3.x。节点启动不会主动安装 Nginx。
 
 新配置不兼容旧宽泛 targets 和任意目录前缀策略；不能给旧服务发送新 JSON 字段后假设协议有效。
 
 已有文件无新状态时禁止直接发布。config/whitelist 提供 `-adopt-target/-adopt-branch/-adopt-commit` 离线导入：仅接受旧 latest 指向本目标完整提交子目录，逐文件与允许 Git 来源比对，建立快照、耐久意图后执行切换和验证。旧目录保留，中断后启动恢复。导入期间旧发布进程必须停止。
 
-当前不自动转换旧前端目录。应在新目标适配共享 assets 路由，验证后按站点流程切换入口。旧状态文件不直接转换成新事务成功记录。
+当前不自动转换旧 Git 前端目录和状态。应在新空目录验证 ORAS 制品和 Nginx latest root 后按站点流程切换入口；启用 shared_assets 才需要额外共享资源路由。旧状态文件不直接转换成新事务成功记录。
 
 systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown 和发布结束。部署示例路径应按本机安装位置调整。
 
@@ -330,7 +345,9 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | internal/infrastructure/nginx | 指定实例测试/reload、worker 与 HTTP 生效验证 |
 | internal/infrastructure/state | 事务模型的单文件 JSON 持久化 |
 | internal/infrastructure/fsutil | 目录句柄、原子写与受限清理 |
-| internal/infrastructure/git | 允许来源、提交校验、受限归档 |
+| internal/infrastructure/git | Git 类型的允许来源、提交校验、归档 |
+| internal/infrastructure/oras | 前端固定 digest manifest 校验、oras pull、文件核验和 gzip 解包 |
+| internal/infrastructure/archive | Git/tar 共用的受限安全解包 |
 | internal/infrastructure/lock / process | 共享锁、子进程期限与进程组 |
 | internal/infrastructure/prom / applog | 有限指标与 JSON 日志 |
 | internal/config | 严格 YAML、参数与目标映射校验 |
@@ -367,6 +384,8 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 | XFF 伪造、未认证标签输入 | 不绕过来源授权，不增加任意业务标签 |
 | JSON 访问日志、401/403/404/500、panic | IP/状态码/耗时正确，令牌/查询参数/异常值不泄漏 |
 | 发布失败、幂等重放、自动恢复失败指标 | 失败计数增一，重放不重计，目标待恢复 Gauge 为 1 |
+| ORAS digest/revision/文件摘要不匹配、危险 layer 和 gzip | 拉取或切换前拒绝，清理半包 |
+| 前端 SHA 同级目录、固定 digest、离线回滚 | 不创建 releases/current，失败不切换，不访问 Harbor 恢复 |
 | 老服务预检/响应丢失/批次磁盘失败 | 写入前停止、按原 ID 查、持久化失败不 POST |
 | 节点旧版本不同/恢复期间版本改变 | 各自恢复或停止 |
 
@@ -376,7 +395,8 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 2. 真实站点 include/白名单规则、Host/SNI、文件访问权限与 PID 配置一致性。
 3. 真实前端浏览器旧页面懒加载、CDN/缓存期限、动态资源路径与跨版本路由。
 4. Jenkins 凭据、持久归档和 Copy Artifact 权限；中断后使用原批次文件恢复。
-5. 部署文件系统上的异常断电/fsync 行为，以及长期磁盘容量和记录归档方案。
+5. 真实 Harbor 的 Robot、代理、CA、SHA 不可变标签及 prod 发布后更新。
+6. 部署文件系统上的异常断电/fsync 行为，以及长期磁盘容量和记录归档方案。
 
 当前没有实际 Nginx 二进制，下载未获批准，第 1 项未运行。不能把 Runtime 注入测试等同于该实例验收。测试应使用隔离目录和专用实例。
 

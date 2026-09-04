@@ -1,4 +1,4 @@
-// HTTP 发布流水线。Jenkins 的 agent 只指定构建执行器，节点部署始终使用 HTTP。
+// HTTP 发布流水线。Jenkins 的 agent 只指定构建执行器，节点部署用 curl 直连 HTTP。
 // 本 Job 发布配置/白名单：commit 取当前 Job 检出的 GitLab 仓库 GIT_COMMIT。
 // 回滚只用于前端发布 Job，不在本流水线提供。
 pipeline {
@@ -15,17 +15,14 @@ pipeline {
     RELEASE_PROJECT = 'ybf'
     RELEASE_PATH_DEST = '/data/nginx-publish'
     RELEASE_CREDENTIAL_ID = 'release-token-uat'
-    RELEASE_FAILURE_POLICY = 'stop'
     SERVICE_URLS_ybf_uat_nginx = 'http://127.0.0.1:9166,http://127.0.0.1:9167'
     SERVICE_URLS_jp_ybf_uat_nginx = 'http://127.0.0.1:9168,http://127.0.0.1:9169'
   }
   stages {
-    stage('Prepare HTTP batch') {
+    stage('Prepare') {
       steps {
         script {
-          if (!isUnix()) { error('发布执行器需要 Bash 和 Python 3.9+，请使用 Linux 执行器') }
-          env.RELEASE_ACTION = params.ACTION
-          env.RELEASE_BATCH_FILE = "http-release-${env.BUILD_NUMBER}/release-batch.json"
+          if (!isUnix()) { error('发布执行器需要 curl，请使用 Linux 执行器') }
           env.RELEASE_SERVER_NAME = params.SERVER_NAME
           env.RELEASE_URLS = env["SERVICE_URLS_${params.SERVER_NAME.replace('-', '_')}"]
           def gitBranch = env.GIT_BRANCH ?: env.BRANCH_NAME ?: env.RELEASE_BRANCH
@@ -38,22 +35,56 @@ pipeline {
             error('当前 Job 检出的 GitLab 提交必须是完整 SHA（GIT_COMMIT）')
           }
           if (!env.RELEASE_URLS?.trim()) { error('未配置该站点的节点 HTTP 地址') }
+          writeFile file: 'release-request.json', text: groovy.json.JsonOutput.toJson([
+            env: env.RELEASE_ENV,
+            type: env.RELEASE_TYPE,
+            branch: env.RELEASE_BRANCH,
+            commit_id: env.RELEASE_COMMIT,
+            project: env.RELEASE_PROJECT,
+            params: [
+              server_name: env.RELEASE_SERVER_NAME,
+              path_dest: env.RELEASE_PATH_DEST
+            ]
+          ])
         }
       }
     }
-    stage('Execute HTTP batch') {
+    stage('Publish') {
       steps {
         withCredentials([string(credentialsId: env.RELEASE_CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
-          sh 'bash scripts/release-apply.sh "$RELEASE_ACTION" --batch-file "$RELEASE_BATCH_FILE"'
+          script {
+            def urls = env.RELEASE_URLS.split(/[\s,]+/).findAll { it }
+            if (!urls) { error('SERVICE_URLS 不能为空') }
+            urls.each { url ->
+              env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
+              echo "发布 ${env.RELEASE_NODE_URL}  type=${env.RELEASE_TYPE} server_name=${env.RELEASE_SERVER_NAME} commit=${env.RELEASE_COMMIT}"
+              sh '''
+                set -eu
+                node="$RELEASE_NODE_URL"
+                echo "GET $node/healthz"
+                health="$(curl -sS --max-time 30 "$node/healthz")"
+                echo "$health"
+                echo "$health" | grep -Eq '"release_contract"[[:space:]]*:[[:space:]]*2' || { echo 'release_contract 必须为 2'; exit 1; }
+                echo "$health" | grep -Eq '"publish_ready"[[:space:]]*:[[:space:]]*true' || { echo '节点 publish_ready 不为 true'; exit 1; }
+                echo "POST $node/api/v1/releases/apply"
+                code="$(curl -sS -o apply-response.json -w '%{http_code}' --max-time 420 \
+                  -X POST "$node/api/v1/releases/apply" \
+                  -H 'Content-Type: application/json' \
+                  -H "X-Release-Token: $RELEASE_TOKEN" \
+                  --data-binary @release-request.json)"
+                cat apply-response.json
+                echo
+                echo "HTTP $code"
+                test "$code" = 200
+              '''
+            }
+          }
         }
       }
     }
   }
   post {
-    always {
-      archiveArtifacts(artifacts: "http-release-${env.BUILD_NUMBER}/release-batch.json", allowEmptyArchive: true)
-    }
-    success { echo 'HTTP 批次已完成；查看归档的逐节点结果。' }
-    failure { echo '发布失败，具体检查/reload 错误见上方控制台和归档结果。配置/白名单 Job 不提供 rollback；修复提交后重新 update。' }
+    success { echo 'HTTP 发布完成。' }
+    failure { echo '发布失败，具体检查/reload 错误见上方控制台。配置/白名单 Job 不提供 rollback；修复提交后重新 update。' }
   }
 }

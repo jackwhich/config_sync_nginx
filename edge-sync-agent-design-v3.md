@@ -248,7 +248,7 @@ CI 先 build/tar，成功后 login/push。推送脚本保存实际推送 manifes
 
 update 只接受新批次文件，resume 从原记录继续，rollback 从同一记录逆序恢复各节点自己的基线。节点身份、当前 revision 和服务能力会再次校验。批次文件有独立进程锁，并原子更新；不保存 Token。
 
-Jenkins 禁止同 Job 并发，归档批次文件。配置/白名单 Job 只提供 update 和 SERVER_NAME；commit_id 使用当前 Job 检出的 GitLab 仓库 GIT_COMMIT。环境、类型、目录和节点地址写在流水线中。回滚只用于前端发布 Job。详见 [Jenkins 发布说明](docs/jenkins.md)。
+Jenkins 禁止同 Job 并发。配置/白名单 Job 只提供 update 和 SERVER_NAME；commit_id 使用当前 Job 检出的 GitLab 仓库 GIT_COMMIT，Jenkinsfile 用 curl 逐节点 POST apply。环境、类型、目录和节点地址写在流水线中。回滚只用于前端发布 Job。详见 [Jenkins 发布说明](docs/jenkins.md)。
 
 ## 十一、可观测性
 
@@ -399,7 +399,7 @@ systemd 关停期限覆盖执行与恢复期限，主进程实际等待 Shutdown
 1. 服务账号执行已有 nginx -t 和 nginx -s reload 的权限与 PATH。
 2. 真实站点 include/白名单规则、Host/SNI、文件访问权限与原有 include/root。
 3. 真实前端浏览器旧页面懒加载、CDN/缓存期限、动态资源路径与跨版本路由。
-4. Jenkins 凭据、持久归档和 Copy Artifact 权限；中断后使用原批次文件恢复。
+4. Jenkins 凭据和节点 HTTP 连通性；配置/白名单 Job 用 curl 直连 apply。
 5. 真实 Harbor 的 Robot、代理、CA、SHA 不可变标签及 prod 发布后更新。
 6. 部署文件系统上的异常断电/fsync 行为，以及长期磁盘容量和记录归档方案。
 

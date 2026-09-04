@@ -48,7 +48,7 @@ var active = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_
 var started = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "release_started_timestamp_seconds", Help: "Start time of the active publication; zero when idle."}, []string{"env", "release_type", "target_id"})
 var lastSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "last_success_timestamp_seconds", Help: "Verification time of current persisted version; zero if never deployed."}, []string{"env", "release_type", "target_id"})
 
-var phaseNames = []string{"verify_baseline", "fetch", "prepare_snapshot", "verify_candidate", "switch", "nginx_test", "reload", "verify_activation"}
+var phaseNames = []string{"verify_baseline", "fetch", "oras_pull", "prepare_snapshot", "verify_candidate", "switch", "nginx_test", "reload", "verify_activation"}
 
 // Initialize finite configured series at zero before the first scrape/publication.
 func InitTarget(env, typ, target string) {

@@ -365,18 +365,25 @@ func reject(req release.ApplyRequest, code int, key, msg string) release.Result 
 	return release.Result{ReleaseID: req.ReleaseID, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: msg, HTTPStatus: code, StartedAt: time.Now().UTC()}
 }
 
-// takeover lets a new publication own the target. RecoveryRequired is a stored
-// outcome of leftover work, not a node lock, so a later request must be able to
-// close that work out and proceed without restarting the process.
-func (r *Runner) takeover(st *state.TargetState, incoming string) {
-	if id := st.ActiveID; id != "" && id != incoming {
-		if rec := st.Records[id]; rec != nil && !rec.Result.Terminal() {
+func leftoverCommit(rec *state.Record) string {
+	if rec.Request.CommitID != "" {
+		return rec.Request.CommitID
+	}
+	return rec.Result.CommitID
+}
+
+// takeover lets a later commit own the target. RecoveryRequired is a stored
+// outcome of leftover work, not a node lock. A new commit_id proceeds; the
+// previous release_id is only closed out when the commit itself changed.
+func (r *Runner) takeover(st *state.TargetState, req release.ApplyRequest) {
+	if id := st.ActiveID; id != "" && id != req.ReleaseID {
+		if rec := st.Records[id]; rec != nil && !rec.Result.Terminal() && leftoverCommit(rec) != req.CommitID {
 			rec.Result.Status = release.NodeStatusFailed
 			rec.Result.ErrorCode = "SUPERSEDED"
-			rec.Result.Error = "superseded by a newer publication"
+			rec.Result.Error = "superseded by a newer commit"
 			rec.Result.FinishedAt = time.Now().UTC()
 			rec.HTTPStatus = http.StatusConflict
-			applog.LogWarn("新发布接管未完成的旧任务", "release_superseded", map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "target_id": st.Target.ID, "release_id": id, "incoming_release_id": incoming})
+			applog.LogWarn("新提交接管未完成的旧任务", "release_superseded", map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "target_id": st.Target.ID, "release_id": id, "commit_id": leftoverCommit(rec), "incoming_commit_id": req.CommitID})
 		}
 	}
 	st.ActiveID = ""
@@ -394,12 +401,13 @@ func (r *Runner) duplicate(req release.ApplyRequest, fingerprint string) (releas
 			result.HTTPStatus = rec.HTTPStatus
 			if result.Terminal() {
 				result.Replayed = true
-			} else if result.Status == release.NodeStatusRecoveryRequired {
-				result.HTTPStatus = 503
-			} else {
-				result.HTTPStatus = 409
-				result.ErrorCode = "RELEASE_RUNNING"
+				return result, true
 			}
+			if result.Status == release.NodeStatusRecoveryRequired {
+				return release.Result{}, false
+			}
+			result.HTTPStatus = 409
+			result.ErrorCode = "RELEASE_RUNNING"
 			return result, true
 		}
 	}
@@ -500,7 +508,7 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 	if req.RestoreOf != "" && req.Type == release.ReleaseTypeFrontendStatic && st.Records[req.RestoreOf].Baseline.ArtifactDigest != req.ArtifactDigest {
 		return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "artifact digest must match the recorded local baseline")
 	}
-	r.takeover(st, req.ReleaseID)
+	r.takeover(st, req)
 	prom.Active(t.Env, string(t.Type), t.ID, true)
 	defer prom.Active(t.Env, string(t.Type), t.ID, false)
 	rec := &state.Record{Request: req, Fingerprint: fingerprint, Baseline: st.Current, BaselinePrevious: st.Previous, HTTPStatus: 409}

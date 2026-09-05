@@ -522,17 +522,40 @@ func TestRecoveryFailureDoesNotBlockNewPublication(t *testing.T) {
 		t.Fatal("a stored release outcome changed service health")
 	}
 	f.rt.reload = nil
-	retry := f.r.Apply(context.Background(), f.request(b))
-	if retry.Status != release.NodeStatusSucceeded {
-		t.Fatalf("new work rejected: %+v", retry)
+	c := f.commit("C")
+	next := f.r.Apply(context.Background(), f.request(c))
+	if next.Status != release.NodeStatusSucceeded {
+		t.Fatalf("new commit rejected: %+v", next)
 	}
 	st, link := f.current()
-	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != b || link != b {
+	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != c || link != c {
 		t.Fatalf("takeover: %+v %s", st, link)
 	}
 	replay := f.r.Apply(context.Background(), req)
 	if !replay.Replayed || replay.Status != release.NodeStatusFailed || replay.ErrorCode != "SUPERSEDED" {
 		t.Fatalf("superseded result: %+v", replay)
+	}
+}
+
+func TestSameCommitRetriesAfterRecoveryRequired(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	f.rt.reload = func(context.Context) error { return errors.New("nginx unavailable") }
+	req := f.request(b)
+	got := f.r.Apply(context.Background(), req)
+	if got.Status != release.NodeStatusRecoveryRequired || got.HTTPStatus != 503 {
+		t.Fatalf("%+v", got)
+	}
+	f.rt.reload = nil
+	retry := f.r.Apply(context.Background(), req)
+	if retry.Status != release.NodeStatusSucceeded || retry.CommitID != b || retry.Replayed {
+		t.Fatalf("same commit retry: %+v", retry)
+	}
+	st, link := f.current()
+	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != b || link != b {
+		t.Fatalf("retry state: %+v %s", st, link)
 	}
 }
 

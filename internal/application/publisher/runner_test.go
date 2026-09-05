@@ -160,8 +160,11 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 	st, link := f.current()
-	if st.Current.CommitID != a || link != "releases/"+a || st.Revision == req.ExpectedStateRevision {
+	if st.Current.CommitID != a || link != a || st.Revision == req.ExpectedStateRevision {
 		t.Fatal("activation/state mismatch")
+	}
+	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, "releases")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("config release unexpectedly created releases directory: %v", err)
 	}
 	replay := f.r.Apply(context.Background(), req)
 	if !replay.Replayed || replay.StateRevisionAfter != res.StateRevisionAfter {
@@ -212,7 +215,7 @@ func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 		t.Fatalf("%+v", failed)
 	}
 	st, link := f.current()
-	if st.Current.CommitID != a || link != "releases/"+a || st.Revision == before.Revision {
+	if st.Current.CommitID != a || link != a || st.Revision == before.Revision {
 		t.Fatal("baseline/revision not restored")
 	}
 	f.rt.reload = nil
@@ -297,7 +300,7 @@ func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
 	f.rt.reload = nil
 	f.restart()
 	st, link := f.current()
-	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != a || link != "releases/"+a {
+	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != a || link != a {
 		t.Fatalf("recovery: %+v %s", st, link)
 	}
 	if got = f.r.Apply(context.Background(), req); !got.Replayed || got.Status != release.NodeStatusFailed {
@@ -322,7 +325,7 @@ func TestStateCommitFailureNeverReportsSuccess(t *testing.T) {
 	}
 	f.restart()
 	st, link := f.current()
-	if st.Current.CommitID != a || st.ActiveID != "" || link != "releases/"+a {
+	if st.Current.CommitID != a || st.ActiveID != "" || link != a {
 		t.Fatal("durable intent not recovered")
 	}
 	got = f.r.Apply(context.Background(), req)
@@ -360,7 +363,7 @@ func TestDriftAndCorruptSnapshotDoNotSkip(t *testing.T) {
 			f.apply(a)
 			target := f.cfg.Targets[0]
 			if kind == "content" {
-				if e := os.WriteFile(filepath.Join(target.Dir, "releases", a, "site.conf"), []byte("changed"), 0644); e != nil {
+				if e := os.WriteFile(filepath.Join(target.Dir, a, "site.conf"), []byte("changed"), 0644); e != nil {
 					t.Fatal(e)
 				}
 			} else {
@@ -395,7 +398,7 @@ func TestCleanupProtectsPreviousAndWarnsAfterSuccess(t *testing.T) {
 		t.Fatal("cleanup failure was not reported")
 	}
 	st, link := f.current()
-	if st.Previous.CommitID != a || link != "releases/"+b {
+	if st.Previous.CommitID != a || link != b {
 		t.Fatal("cleanup rolled back or forgot previous")
 	}
 }

@@ -168,24 +168,26 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, e
 	}
 	defer base.Close()
-	dirs := []string{".staging", ".manifests"}
-	if t.Type != release.ReleaseTypeFrontendStatic {
-		dirs = append(dirs, "releases")
-	}
-	for _, dir := range dirs {
+	for _, dir := range []string{".staging", ".manifests"} {
 		if e = fsutil.EnsureDirs(base, dir, 0755); e != nil {
 			return nil, e
 		}
 	}
 	if m, e := loadManifest(base, commit); e == nil {
-		v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: t.SnapshotLink(commit), ManifestDigest: manifestDigest(m)}
+		link, e := existingSnapshotLink(base, commit)
+		if e != nil {
+			return nil, e
+		}
+		v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: link, ManifestDigest: manifestDigest(m)}
 		_, e = verifySnapshot(ctx, base, v)
 		return v, e
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
-	if _, e = base.Lstat(t.SnapshotLink(commit)); e == nil {
+	if _, e = existingSnapshotLink(base, commit); e == nil {
 		return nil, fmt.Errorf("snapshot exists without a trusted manifest; recovery required")
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return nil, e
 	}
 	src, e := os.OpenRoot(work)
 	if e != nil {
@@ -300,6 +302,25 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	}
 	v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: t.SnapshotLink(commit), ManifestDigest: manifestDigest(m)}
 	return v, nil
+}
+
+// existingSnapshotLink accepts the former releases/<commit> layout only to
+// keep an already-published snapshot recoverable during the layout migration.
+// New snapshots always use the direct <commit> layout.
+func existingSnapshotLink(base *os.Root, commit string) (string, error) {
+	for _, link := range []string{commit, "releases/" + commit} {
+		info, err := base.Lstat(link)
+		if err == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("snapshot is not a real directory: %s", link)
+			}
+			return link, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", os.ErrNotExist
 }
 func syncTree(root *os.Root) error {
 	var dirs []string
@@ -501,7 +522,11 @@ func cleanupSnapshots(ctx context.Context, c config.Config, t config.Target, st 
 			}
 			continue
 		}
-		if e = fsutil.RemoveTree(ctx, base, t.SnapshotLink(m.CommitID)); e != nil {
+		link, e := existingSnapshotLink(base, m.CommitID)
+		if e != nil {
+			return e
+		}
+		if e = fsutil.RemoveTree(ctx, base, link); e != nil {
 			return e
 		}
 		if e = base.Remove(".manifests/" + m.CommitID + ".json"); e != nil {

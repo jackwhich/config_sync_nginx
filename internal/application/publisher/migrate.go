@@ -150,7 +150,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if e = rt.Test(ctx); e != nil {
 		return e
 	}
-	// The legacy files are identical. A local baseline under releases/ is now valid.
+	// The legacy files are identical. A local baseline under the complete commit is now valid.
 	// Persist an ordinary switch intent before touching latest, so startup can finish it.
 	id := release.ID()
 	req := release.ApplyRequest{ReleaseID: id, ExpectedStateRevision: st.Revision, Env: target.Env, Type: target.Type, SourceRepo: string(target.Type), Branch: branch, CommitID: commit, Version: commit, Project: target.Project, Params: map[string]string{"path_dest": target.PathDest, "server_name": target.ServerName}}

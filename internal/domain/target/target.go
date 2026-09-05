@@ -62,10 +62,7 @@ func (t Target) Mode() os.FileMode {
 	return os.FileMode(v)
 }
 
-// SnapshotLink is relative to <path_dest>/<server_name> for frontend releases.
+// SnapshotLink is relative to <path_dest>/<server_name>.
 func (t Target) SnapshotLink(commit string) string {
-	if t.Type == release.ReleaseTypeFrontendStatic {
-		return commit
-	}
-	return "releases/" + commit
+	return commit
 }

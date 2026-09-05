@@ -16,7 +16,7 @@
   .manifests/<完整 git SHA>.json          # 服务生成的完整文件摘要
 ```
 
-没有中间的 releases 目录，也不使用 current。配置和白名单的既有 Git 发布目录保持 `<path_dest>/<type>/<server_name>/releases/<SHA>` + latest。
+所有发布类型都没有中间的 releases 目录，也不使用 current；`latest` 和完整 SHA 快照目录同级。
 
 ## 制品身份与契约
 
@@ -160,7 +160,7 @@ CI Robot 需要指定项目的 pull/push 与 tag 权限（Harbor 的 push 需同
 
 默认 shared_assets=false 可投递普通构建 dist，不要求 Python 或 frontend-manifest.json；HTML/版本探针不缓存。latest 切换后，旧页面再请求仅存在于旧版本的资源可能 404，即使旧 SHA 目录还在磁盘也不会自动路由过去。有长时间打开页面和懒加载需求时，启用 shared_assets=true 并配置独立共享 /assets 路由，沿用哈希资源清单校验及 asset_retention 窗口；这才需要可选的 frontend-manifest.py 工具。
 
-旧 `<path_dest>/frontend_static/<server_name>/releases/...` 目录和 Git 来源状态不自动认领为新 ORAS 状态。先在新空目录和独立验证入口试发布，保留旧目录，检查生产 Nginx root 切换方案；不要手改状态文件或 `.publisher.json`。服务遇到已有未管理文件会要求明确迁移。
+旧 Git 来源状态不自动认领为新 ORAS 状态。先在新空目录和独立验证入口试发布，保留旧目录，检查生产 Nginx root 切换方案；不要手改状态文件或 `.publisher.json`。服务遇到已有未管理文件会要求明确迁移。
 
 已通过测试覆盖 manifest/文件摘要错误、revision 不匹配、危险 layer、gzip 损坏、tar 穿越/链接/限额、SHA 目录布局、摘要冲突、失败不切换、离线恢复和客户端能力预检。真实 Harbor Robot/代理/TLS 以及实际 Nginx 实例仍需部署环境联调；注入 ORAS 返回结果的测试不能替代真实网络验收。
 

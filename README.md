@@ -73,10 +73,10 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
   .publisher.json
   .staging/stage-<随机 UUID>/
   .manifests/<完整 commit>.json
-  releases/<完整 commit>/
+  <完整 commit>/
     site.conf
     .release-version
-  latest -> releases/<完整 commit>
+  latest -> <完整 commit>
 ```
 
 Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。

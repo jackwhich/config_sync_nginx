@@ -205,7 +205,7 @@ func TestSnapshotRetentionProtectsOldPrevious(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	st.Previous = &state.Version{CommitID: old, Source: m.Source, Link: "releases/" + old, ManifestDigest: manifestDigest(m)}
+	st.Previous = &state.Version{CommitID: old, Source: m.Source, Link: old, ManifestDigest: manifestDigest(m)}
 	f.cfg.KeepReleases = 2
 	if e = cleanupSnapshots(context.Background(), f.cfg, f.cfg.Targets[0], st); e != nil {
 		t.Fatal(e)

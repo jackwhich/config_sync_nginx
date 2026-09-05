@@ -99,9 +99,10 @@ Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch`
 | `POST /api/v1/releases/apply` | 同步、校验、切换 latest；成功暂挂时返回 HTTP 202 |
 | `POST /api/v1/releases/nginx/test` | 对指定暂挂 release_id 执行 nginx -t；成功后返回 HTTP 202 |
 | `POST /api/v1/releases/nginx/reload` | 对已通过检测的 release_id 执行 reload 与生效验证；成功后返回 HTTP 200 |
+| `POST /api/v1/releases/abort` | Jenkins 在阶段异常时取消暂挂 release，并恢复原 latest |
 | `GET /metrics` | 有限维度的 Prometheus 指标 |
 
-apply、nginx/test、nginx/reload、state 使用 `X-Release-Token`。Nginx 命令接口请求体只包含 `env` 和 `/apply` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
+apply、nginx/test、nginx/reload、abort、state 使用 `X-Release-Token`。Nginx 命令和 abort 接口请求体只包含 `env` 和 `/apply` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
 
 简单发布请求如下，`commitid` 也可作为 `commit_id` 的兼容别名：
 

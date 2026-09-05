@@ -34,6 +34,9 @@ func (p resultPublisher) NginxTest(context.Context, release.NginxCommandRequest)
 func (p resultPublisher) NginxReload(context.Context, release.NginxCommandRequest) release.Result {
 	return p.result
 }
+func (p resultPublisher) Abort(context.Context, release.NginxCommandRequest) release.Result {
+	return p.result
+}
 
 func TestNginxErrorsReachHTTPClient(t *testing.T) {
 	diagnostic := "nginx -t: nginx failed: exit status 1: nginx: [emerg] unknown directive in site.conf:7"

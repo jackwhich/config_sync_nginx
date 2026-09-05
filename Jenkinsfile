@@ -1,41 +1,6 @@
 // HTTP 发布流水线。Jenkins 的 agent 只指定构建执行器，节点部署用 curl 直连 HTTP。
 // 本 Job 只发布 config / whitelist；前端制品请使用独立的 Jenkinsfile。
 // 发布提交来自下方配置的 GitLab 仓库，而不是 Jenkinsfile 所在仓库。
-def parseReleaseResponse(text, label, statusCode) {
-  try {
-    return new groovy.json.JsonSlurperClassic().parseText(text)
-  } catch (Exception ignored) {
-    echo "${label}响应不是有效 JSON：\n${text}"
-    error("${label}返回 HTTP ${statusCode}，无法解析响应")
-  }
-}
-
-def showReleaseStage(title, node, result, statusCode, stepNames, releaseEnv, releaseType, serverName, commit, branch) {
-  def steps = result.steps ?: []
-  echo "========== 节点发布详情：${title} =========="
-  echo "节点主机：${node.node_id ?: 'unknown'}  服务地址：${node.url}"
-  echo "发布对象：type=${result.type ?: releaseType} server_name=${result.server_name ?: serverName} commit=${result.commit_id ?: commit}"
-  echo "release_id=${result.release_id ?: node.release_id ?: '-'}"
-  stepNames.each { spec ->
-    def step = steps.find { item -> item.name == spec.name }
-    if (step == null) {
-      echo "${spec.title}: 未执行"
-    } else {
-      echo "${spec.title}: status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
-      if (step.message) {
-        echo "  ${step.message}"
-      }
-    }
-  }
-  echo "节点状态：${node.node_id ?: 'unknown'} status=${result.status ?: '-'} activation=${result.activation_status ?: '-'} HTTP ${statusCode}"
-  echo '=========================================='
-}
-
-def failReleaseStage(title, text, statusCode) {
-  echo "${title}失败，HTTP ${statusCode}：\n${groovy.json.JsonOutput.prettyPrint(text)}"
-  error("节点发布失败：${title}，HTTP ${statusCode}")
-}
-
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds(); skipDefaultCheckout() }
@@ -104,47 +69,48 @@ pipeline {
           script {
             def urls = env.RELEASE_URLS.split(/[\s,]+/).findAll { it }
             if (!urls) { error('SERVICE_URLS 不能为空') }
-            def progress = [nodes: []]
-            def saveProgress = { writeFile file: 'release-progress.json', text: groovy.json.JsonOutput.toJson(progress) }
             urls.eachWithIndex { url, index ->
               env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
-              echo "同步 ${env.RELEASE_NODE_URL}  type=${env.RELEASE_TYPE} server_name=${env.RELEASE_SERVER_NAME} commit=${env.RELEASE_COMMIT}"
-              def code = sh(script: '''
+              sh(script: """
                 set -eu
-                node="$RELEASE_NODE_URL"
-                echo "GET $node/healthz"
-                health="$(curl -sS --max-time 30 "$node/healthz")"
-                printf '%s' "$health" > "sync-health-''' + index + '''.json"
-                echo "$health" | grep -Eq '"release_contract"[[:space:]]*:[[:space:]]*2' || { echo 'release_contract 必须为 2'; exit 1; }
-                echo "$health" | grep -Eq '"publish_ready"[[:space:]]*:[[:space:]]*true' || { echo '节点 publish_ready 不为 true'; exit 1; }
-                echo "POST $node/api/v1/releases/apply"
-                code="$(curl -sS -o "sync-response-''' + index + '''.json" -w '%{http_code}' --max-time 420 \
-                  -X POST "$node/api/v1/releases/apply" \
-                  -H 'Content-Type: application/json' \
-                  -H "X-Release-Token: $RELEASE_TOKEN" \
-                  --data-binary @release-request.json)"
-                printf '%s' "$code"
-              ''', returnStdout: true).trim()
-
-              def responseText = readFile("sync-response-${index}.json")
-              def response = parseReleaseResponse(responseText, '同步发布', code)
-              def health = parseReleaseResponse(readFile("sync-health-${index}.json"), '健康检查', '200')
-              def node = [url: env.RELEASE_NODE_URL, node_id: health.node_id, release_id: response.release_id,
-                          skipped: code == '200' && response.status == 'skipped', sync: response, sync_http_code: code]
-              showReleaseStage('同步 Git 并切换 latest', node, response, code, [
-                [title: "Git 更新（branch=${env.RELEASE_BRANCH}）", name: 'fetch'],
-                [title: '配置快照准备', name: 'prepare_snapshot'],
-                [title: '切换 latest', name: 'switch']
-              ], env.RELEASE_ENV, env.RELEASE_TYPE, env.RELEASE_SERVER_NAME, env.RELEASE_COMMIT, env.RELEASE_BRANCH)
-              if (node.skipped) {
-                echo "${node.node_id ?: node.url} 已是目标 commit，后续 nginx -t 和 reload 阶段将跳过。"
-              } else {
-                if (code != '202' || response.status != 'running' || response.phase != 'awaiting_nginx_test') {
-                  failReleaseStage('同步 Git 并切换 latest', responseText, code)
+                show_json() {
+                  if command -v python3 >/dev/null 2>&1; then python3 -m json.tool < "\$1"; else cat "\$1"; fi
                 }
-              }
-              progress.nodes << node
-              saveProgress()
+                node="\$RELEASE_NODE_URL"
+                echo "========== 同步 Git 并切换 latest：\$node =========="
+                echo "GET \$node/healthz"
+                health="\$(curl -sS --max-time 30 "\$node/healthz")"
+                printf '%s' "\$health" > "sync-health-${index}.json"
+                echo "\$health" | grep -Eq '"release_contract"[[:space:]]*:[[:space:]]*2' || { echo 'release_contract 必须为 2'; exit 1; }
+                echo "\$health" | grep -Eq '"publish_ready"[[:space:]]*:[[:space:]]*true' || { echo '节点 publish_ready 不为 true'; exit 1; }
+                node_id="\$(sed -nE 's/.*"node_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-health-${index}.json" | head -n 1)"
+                test -n "\$node_id" || { echo '健康检查缺少 node_id'; exit 1; }
+                printf '%s\n' "\$node_id" > "release-node-${index}.txt"
+                echo "POST \$node/api/v1/releases/apply"
+                code="\$(curl -sS -o "sync-response-${index}.json" -w '%{http_code}' --max-time 420 \\
+                  -X POST "\$node/api/v1/releases/apply" \\
+                  -H 'Content-Type: application/json' \\
+                  -H "X-Release-Token: \$RELEASE_TOKEN" \\
+                  --data-binary @release-request.json)"
+                echo "节点主机：\$node_id  HTTP \$code"
+                show_json "sync-response-${index}.json"
+                if [ "\$code" = 200 ] && grep -Eq '"status"[[:space:]]*:[[:space:]]*"skipped"' "sync-response-${index}.json"; then
+                  printf '%s\n' skipped > "release-status-${index}.txt"
+                  : > "release-id-${index}.txt"
+                  echo "\$node_id 已是目标 commit；nginx -t 和 reload 阶段将跳过。"
+                  echo '=============================================='
+                  exit 0
+                fi
+                test "\$code" = 202 || { echo "同步接口应返回 HTTP 202，实际为 \$code"; exit 1; }
+                grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "sync-response-${index}.json" || { echo '同步响应 status 不是 running'; exit 1; }
+                grep -Eq '"phase"[[:space:]]*:[[:space:]]*"awaiting_nginx_test"' "sync-response-${index}.json" || { echo '同步响应未进入 awaiting_nginx_test'; exit 1; }
+                release_id="\$(sed -nE 's/.*"release_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-response-${index}.json" | head -n 1)"
+                echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '同步响应缺少合法 release_id'; exit 1; }
+                printf '%s\n' "\$release_id" > "release-id-${index}.txt"
+                printf '%s\n' waiting_test > "release-status-${index}.txt"
+                echo "Git 更新、快照准备和 latest 切换已完成；release_id=\$release_id"
+                echo '=============================================='
+              """)
             }
           }
         }
@@ -154,38 +120,38 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: env.RELEASE_CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
           script {
-            def progress = parseReleaseResponse(readFile('release-progress.json'), '发布进度文件', 'local')
-            def nodes = progress.nodes ?: []
-            if (!nodes) { error('同步阶段没有可继续的节点') }
-            def saveProgress = { writeFile file: 'release-progress.json', text: groovy.json.JsonOutput.toJson(progress) }
-            nodes.eachWithIndex { node, index ->
-              if (node.skipped) {
-                echo "${node.node_id ?: node.url} 已是目标 commit，跳过 nginx -t。"
-                return
-              }
-              env.RELEASE_NODE_URL = node.url
-              writeFile file: "nginx-test-request-${index}.json", text: groovy.json.JsonOutput.toJson([env: env.RELEASE_ENV, release_id: node.release_id])
-              def code = sh(script: """
+            def urls = env.RELEASE_URLS.split(/[\s,]+/).findAll { it }
+            if (!urls) { error('SERVICE_URLS 不能为空') }
+            urls.eachWithIndex { url, index ->
+              env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
+              sh(script: """
                 set -eu
+                show_json() {
+                  if command -v python3 >/dev/null 2>&1; then python3 -m json.tool < "\$1"; else cat "\$1"; fi
+                }
+                node_id="\$(cat "release-node-${index}.txt")"
+                state="\$(cat "release-status-${index}.txt")"
+                if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -t。"; exit 0; fi
+                test "\$state" = waiting_test || { echo "节点 \$node_id 不在等待 nginx -t 状态：\$state"; exit 1; }
+                release_id="\$(cat "release-id-${index}.txt")"
+                echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '缺少合法 release_id'; exit 1; }
+                printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "nginx-test-request-${index}.json"
+                echo "========== nginx -t 配置检测：\$node_id (\$RELEASE_NODE_URL) =========="
                 echo "POST \$RELEASE_NODE_URL/api/v1/releases/nginx/test"
-                code=\"\$(curl -sS -o 'nginx-test-response-${index}.json' -w '%{http_code}' --max-time 120 \\
-                  -X POST \"\$RELEASE_NODE_URL/api/v1/releases/nginx/test\" \\
+                code="\$(curl -sS -o 'nginx-test-response-${index}.json' -w '%{http_code}' --max-time 120 \\
+                  -X POST "\$RELEASE_NODE_URL/api/v1/releases/nginx/test" \\
                   -H 'Content-Type: application/json' \\
-                  -H \"X-Release-Token: \$RELEASE_TOKEN\" \\
-                  --data-binary @'nginx-test-request-${index}.json')\"
-                printf '%s' \"\$code\"
-              """, returnStdout: true).trim()
-              def responseText = readFile("nginx-test-response-${index}.json")
-              def response = parseReleaseResponse(responseText, 'nginx -t', code)
-              node.nginx_test = response
-              node.nginx_test_http_code = code
-              saveProgress()
-              showReleaseStage('nginx -t 配置检测', node, response, code, [
-                [title: 'Nginx 配置检测（nginx -t）', name: 'nginx_test']
-              ], env.RELEASE_ENV, env.RELEASE_TYPE, env.RELEASE_SERVER_NAME, env.RELEASE_COMMIT, env.RELEASE_BRANCH)
-              if (code != '202' || response.status != 'running' || response.phase != 'awaiting_nginx_reload') {
-                failReleaseStage('nginx -t 配置检测', responseText, code)
-              }
+                  -H "X-Release-Token: \$RELEASE_TOKEN" \\
+                  --data-binary @'nginx-test-request-${index}.json')"
+                echo "节点主机：\$node_id  release_id=\$release_id  HTTP \$code"
+                show_json "nginx-test-response-${index}.json"
+                test "\$code" = 202 || { echo "nginx -t 接口应返回 HTTP 202，实际为 \$code"; exit 1; }
+                grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "nginx-test-response-${index}.json" || { echo 'nginx -t 响应 status 不是 running'; exit 1; }
+                grep -Eq '"phase"[[:space:]]*:[[:space:]]*"awaiting_nginx_reload"' "nginx-test-response-${index}.json" || { echo 'nginx -t 未进入 awaiting_nginx_reload'; exit 1; }
+                printf '%s\n' waiting_reload > "release-status-${index}.txt"
+                echo 'nginx -t 检测完成，等待 reload。'
+                echo '=============================================='
+              """)
             }
           }
         }
@@ -195,39 +161,37 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: env.RELEASE_CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
           script {
-            def progress = parseReleaseResponse(readFile('release-progress.json'), '发布进度文件', 'local')
-            def nodes = progress.nodes ?: []
-            if (!nodes) { error('同步阶段没有可继续的节点') }
-            def saveProgress = { writeFile file: 'release-progress.json', text: groovy.json.JsonOutput.toJson(progress) }
-            nodes.eachWithIndex { node, index ->
-              if (node.skipped) {
-                echo "${node.node_id ?: node.url} 已是目标 commit，跳过 nginx -s reload。"
-                return
-              }
-              env.RELEASE_NODE_URL = node.url
-              writeFile file: "nginx-reload-request-${index}.json", text: groovy.json.JsonOutput.toJson([env: env.RELEASE_ENV, release_id: node.release_id])
-              def code = sh(script: """
+            def urls = env.RELEASE_URLS.split(/[\s,]+/).findAll { it }
+            if (!urls) { error('SERVICE_URLS 不能为空') }
+            urls.eachWithIndex { url, index ->
+              env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
+              sh(script: """
                 set -eu
+                show_json() {
+                  if command -v python3 >/dev/null 2>&1; then python3 -m json.tool < "\$1"; else cat "\$1"; fi
+                }
+                node_id="\$(cat "release-node-${index}.txt")"
+                state="\$(cat "release-status-${index}.txt")"
+                if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -s reload。"; exit 0; fi
+                test "\$state" = waiting_reload || { echo "节点 \$node_id 不在等待 reload 状态：\$state"; exit 1; }
+                release_id="\$(cat "release-id-${index}.txt")"
+                echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '缺少合法 release_id'; exit 1; }
+                printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "nginx-reload-request-${index}.json"
+                echo "========== nginx -s reload 与生效验证：\$node_id (\$RELEASE_NODE_URL) =========="
                 echo "POST \$RELEASE_NODE_URL/api/v1/releases/nginx/reload"
-                code=\"\$(curl -sS -o 'nginx-reload-response-${index}.json' -w '%{http_code}' --max-time 120 \\
-                  -X POST \"\$RELEASE_NODE_URL/api/v1/releases/nginx/reload\" \\
+                code="\$(curl -sS -o 'nginx-reload-response-${index}.json' -w '%{http_code}' --max-time 120 \\
+                  -X POST "\$RELEASE_NODE_URL/api/v1/releases/nginx/reload" \\
                   -H 'Content-Type: application/json' \\
-                  -H \"X-Release-Token: \$RELEASE_TOKEN\" \\
-                  --data-binary @'nginx-reload-request-${index}.json')\"
-                printf '%s' \"\$code\"
-              """, returnStdout: true).trim()
-              def responseText = readFile("nginx-reload-response-${index}.json")
-              def response = parseReleaseResponse(responseText, 'nginx -s reload', code)
-              node.nginx_reload = response
-              node.nginx_reload_http_code = code
-              saveProgress()
-              showReleaseStage('nginx -s reload 与生效验证', node, response, code, [
-                [title: 'Nginx 重载（nginx -s reload）', name: 'reload'],
-                [title: '生效验证', name: 'verify_activation']
-              ], env.RELEASE_ENV, env.RELEASE_TYPE, env.RELEASE_SERVER_NAME, env.RELEASE_COMMIT, env.RELEASE_BRANCH)
-              if (code != '200' || response.status != 'succeeded') {
-                failReleaseStage('nginx -s reload 与生效验证', responseText, code)
-              }
+                  -H "X-Release-Token: \$RELEASE_TOKEN" \\
+                  --data-binary @'nginx-reload-request-${index}.json')"
+                echo "节点主机：\$node_id  release_id=\$release_id  HTTP \$code"
+                show_json "nginx-reload-response-${index}.json"
+                test "\$code" = 200 || { echo "reload 接口应返回 HTTP 200，实际为 \$code"; exit 1; }
+                grep -Eq '"status"[[:space:]]*:[[:space:]]*"succeeded"' "nginx-reload-response-${index}.json" || { echo 'reload 响应 status 不是 succeeded'; exit 1; }
+                printf '%s\n' complete > "release-status-${index}.txt"
+                echo 'nginx -s reload 与生效验证完成。'
+                echo '=============================================='
+              """)
             }
           }
         }
@@ -236,6 +200,43 @@ pipeline {
   }
   post {
     success { echo 'HTTP 发布完成。' }
-    failure { echo '发布失败，具体 Git、nginx -t、reload 及自动恢复结果见上方控制台。若节点进入 recovery_required，请先恢复该节点再重新发布。' }
+    failure {
+      withCredentials([string(credentialsId: env.RELEASE_CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
+        script {
+          def urls = env.RELEASE_URLS?.split(/[\s,]+/)?.findAll { it } ?: []
+          urls.eachWithIndex { url, index ->
+            env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
+            sh(script: """
+              set +e
+              status_file="release-status-${index}.txt"
+              id_file="release-id-${index}.txt"
+              if [ ! -f "\$status_file" ] || [ ! -f "\$id_file" ]; then
+                echo "未找到 \$RELEASE_NODE_URL 的暂挂发布记录，无需自动取消。"
+                exit 0
+              fi
+              state="\$(cat "\$status_file")"
+              if [ "\$state" != waiting_test ] && [ "\$state" != waiting_reload ]; then
+                echo "\$RELEASE_NODE_URL 当前状态为 \$state，无需自动取消。"
+                exit 0
+              fi
+              release_id="\$(cat "\$id_file")"
+              echo "流水线失败，自动恢复 \$RELEASE_NODE_URL 的 release_id=\$release_id"
+              printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "release-abort-request-${index}.json"
+              code="\$(curl -sS -o "release-abort-response-${index}.json" -w '%{http_code}' --max-time 120 \\
+                -X POST "\$RELEASE_NODE_URL/api/v1/releases/abort" \\
+                -H 'Content-Type: application/json' \\
+                -H "X-Release-Token: \$RELEASE_TOKEN" \\
+                --data-binary @"release-abort-request-${index}.json")"
+              echo "自动恢复接口 HTTP \$code"
+              if [ -f "release-abort-response-${index}.json" ]; then
+                if command -v python3 >/dev/null 2>&1; then python3 -m json.tool < "release-abort-response-${index}.json"; else cat "release-abort-response-${index}.json"; fi
+              fi
+              exit 0
+            """)
+          }
+        }
+      }
+      echo '发布失败，具体 Git、nginx -t、reload 及自动恢复结果见上方控制台。若节点仍为 recovery_required，请先恢复该节点再重新发布。'
+    }
   }
 }

@@ -355,6 +355,25 @@ func TestStagedNginxReloadFailureRestoresBaseline(t *testing.T) {
 	}
 }
 
+func TestAbortStagedReleaseRestoresBaseline(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	if staged.Status != release.NodeStatusRunning || staged.Phase != "awaiting_nginx_test" {
+		t.Fatal(staged)
+	}
+	aborted := f.r.Abort(context.Background(), release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID})
+	if aborted.Status != release.NodeStatusFailed || aborted.ErrorCode != "RELEASE_ABORTED" || aborted.RollbackStatus != "succeeded" {
+		t.Fatal(aborted)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || st.ActiveID != "" || st.RecoveryRequired || link != a {
+		t.Fatalf("abort did not restore baseline: %+v link=%q", st, link)
+	}
+}
+
 func TestRestartWhileAwaitingNginxCommandRestoresBaseline(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")

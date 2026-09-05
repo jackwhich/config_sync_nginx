@@ -772,6 +772,13 @@ func (r *Runner) NginxReload(ctx context.Context, req release.NginxCommandReques
 	return r.runNginxCommand(ctx, req, "reload")
 }
 
+// Abort restores the baseline for an active release that is waiting for an
+// explicit Nginx command. Jenkins calls this after an unexpected pipeline
+// failure so a staged latest link is never left active indefinitely.
+func (r *Runner) Abort(ctx context.Context, req release.NginxCommandRequest) release.Result {
+	return r.runNginxCommand(ctx, req, "abort")
+}
+
 func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRequest, command string) release.Result {
 	if e := release.ValidateNginxCommandRequest(&req); e != nil {
 		return nginxCommandReject(req, http.StatusBadRequest, "INVALID_REQUEST", e.Error())
@@ -848,6 +855,11 @@ func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRe
 	deadline, cancel := context.WithTimeout(ctx, r.cfg.ExecutionTimeout.Value())
 	defer cancel()
 	switch command {
+	case "abort":
+		if rec.Result.Phase != "awaiting_nginx_test" && rec.Result.Phase != "awaiting_nginx_reload" {
+			return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_PENDING", "release is not awaiting an nginx command")
+		}
+		return r.restore(target, st, rec, "RELEASE_ABORTED", errors.New("release aborted before nginx activation"))
 	case "test":
 		if rec.Result.Phase != "awaiting_nginx_test" {
 			return nginxCommandReject(req, http.StatusConflict, "NGINX_TEST_NOT_PENDING", "release is not awaiting nginx -t")

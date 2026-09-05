@@ -23,6 +23,7 @@ type Publisher interface {
 	Stage(context.Context, release.ApplyRequest) release.Result
 	NginxTest(context.Context, release.NginxCommandRequest) release.Result
 	NginxReload(context.Context, release.NginxCommandRequest) release.Result
+	Abort(context.Context, release.NginxCommandRequest) release.Result
 	Health() map[string]any
 	Target(string) (config.Target, bool)
 	Resolve(release.ReleaseType, string, string, string, ...string) (config.Target, error)
@@ -40,6 +41,7 @@ func New(r Publisher, cfg config.Config) *Server {
 	s.mux.HandleFunc("POST /api/v1/releases/apply", s.apply)
 	s.mux.HandleFunc("POST /api/v1/releases/nginx/test", s.nginxTest)
 	s.mux.HandleFunc("POST /api/v1/releases/nginx/reload", s.nginxReload)
+	s.mux.HandleFunc("POST /api/v1/releases/abort", s.abort)
 	s.mux.HandleFunc("GET /api/v1/releases/state", s.state)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, s.runner.Health()) })
 	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) { s.runner.Health(); prom.MetricsHandler().ServeHTTP(w, r) })
@@ -60,6 +62,8 @@ func (s *Server) Handler() http.Handler {
 			handler = "nginx_test"
 		case "/api/v1/releases/nginx/reload":
 			handler = "nginx_reload"
+		case "/api/v1/releases/abort":
+			handler = "abort"
 		case "/api/v1/releases/state":
 			handler = "state"
 		case "/healthz":
@@ -193,6 +197,10 @@ func (s *Server) nginxTest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) nginxReload(w http.ResponseWriter, r *http.Request) {
 	s.nginxCommand(w, r, s.runner.NginxReload)
+}
+
+func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
+	s.nginxCommand(w, r, s.runner.Abort)
 }
 
 func (s *Server) nginxCommand(w http.ResponseWriter, r *http.Request, run func(context.Context, release.NginxCommandRequest) release.Result) {

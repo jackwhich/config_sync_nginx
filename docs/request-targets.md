@@ -105,6 +105,7 @@ X-Release-Token: <uat 对应的 Token>
 
 - `nginx/test` 只在 `latest` 已切换且阶段为 `awaiting_nginx_test` 时执行 `nginx -t`。通过后返回 HTTP 202、阶段 `awaiting_nginx_reload`。
 - `nginx/reload` 只接受已通过检测的同一 release，执行 `nginx -s reload`、验证候选快照并提交状态；成功才返回 HTTP 200、`status: succeeded`。
+- `POST /api/v1/releases/abort` 使用相同的 `{env, release_id}` 请求体，只接受仍在等待 Nginx 命令的 release。它恢复原来的 `latest` 并检查、reload 旧配置；Jenkins 在自身异常时调用它，防止候选版本长期停在 `latest`。
 - 任一命令失败，服务立即恢复本机原来的 `latest`，对旧配置执行 `nginx -t` 和 reload；不重新拉取 Git 或 Harbor。服务在两个命令之间重启，也会按同样的恢复流程处理，而不会把未检测的候选配置保留为已发布版本。
 
 服务配置不再接受 nginx 块。不读取 PID、不扫描进程、不解析启动参数、不检查 master/worker、不发送自行构造的 HUP，不安装、启动或停止 Nginx。已有 Nginx 主配置、include/root 由现有运维方式维护。

@@ -106,6 +106,42 @@ func TestMinimalHTTPPublishAndEnvironmentTokenBinding(t *testing.T) {
 			t.Fatal(rec.Code, rec.Body.String())
 		}
 	}
+	if err := os.WriteFile(filepath.Join(repo, "site", "site.conf"), []byte("# next fixture\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "next fixture")
+	body["commitid"] = run("rev-parse", "HEAD")
+	rec = post("uat-token")
+	if rec.Code != 202 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(release.NginxCommandRequest{Env: "uat", ReleaseID: result.ReleaseID})
+	req := httptest.NewRequest("POST", "/api/v1/releases/abort", bytes.NewReader(b))
+	req.Header.Set("X-Release-Token", "uat-token")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 500 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ErrorCode != "RELEASE_ABORTED" || result.RollbackStatus != "succeeded" {
+		t.Fatal(result)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	var health map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["publish_ready"] != true {
+		t.Fatal(health)
+	}
 	body["type"] = "whitelist"
 	if rec := post("uat-token"); rec.Code != 403 {
 		t.Fatal(rec.Code, rec.Body.String())

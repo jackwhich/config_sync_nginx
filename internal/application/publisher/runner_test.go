@@ -629,26 +629,85 @@ func TestLocalRestoreDoesNotFetchAndHonorsRevision(t *testing.T) {
 	}
 }
 func TestDriftAndCorruptSnapshotDoNotSkip(t *testing.T) {
-	for _, kind := range []string{"link", "content"} {
-		t.Run(kind, func(t *testing.T) {
-			f := newFixture(t)
-			a := f.commit("A")
-			f.apply(a)
-			target := f.cfg.Targets[0]
-			if kind == "content" {
-				if e := os.WriteFile(filepath.Join(target.Dir, a, "site", "site.conf"), []byte("changed"), 0644); e != nil {
-					t.Fatal(e)
-				}
-			} else {
-				if e := os.Remove(filepath.Join(target.Dir, "latest")); e != nil {
-					t.Fatal(e)
-				}
-			}
-			got := f.r.Apply(context.Background(), f.request(a))
-			if got.Status != release.NodeStatusRecoveryRequired {
-				t.Fatalf("bad baseline skipped: %+v", got)
-			}
-		})
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	target := f.cfg.Targets[0]
+	if e := os.WriteFile(filepath.Join(target.Dir, a, "site", "site.conf"), []byte("changed"), 0644); e != nil {
+		t.Fatal(e)
+	}
+	got := f.r.Apply(context.Background(), f.request(a))
+	if got.Status != release.NodeStatusRecoveryRequired {
+		t.Fatalf("bad baseline skipped: %+v", got)
+	}
+}
+
+func TestMissingLatestIsRepairedForSameCommit(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	if e := os.Remove(filepath.Join(f.cfg.Targets[0].Dir, "latest")); e != nil {
+		t.Fatal(e)
+	}
+	got := f.r.Apply(context.Background(), f.request(a))
+	if got.Status != release.NodeStatusSkipped {
+		t.Fatalf("missing latest was not repaired: %+v", got)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || link != a || st.RecoveryRequired {
+		t.Fatalf("repaired state: %+v %s", st, link)
+	}
+}
+func TestNewCommitAdoptsDivergedLatest(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	f.apply(b)
+	latest := filepath.Join(f.cfg.Targets[0].Dir, "latest")
+	if e := os.Remove(latest); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.Symlink(a, latest); e != nil {
+		t.Fatal(e)
+	}
+	c := f.commit("C")
+	got := f.r.Apply(context.Background(), f.request(c))
+	if got.Status != release.NodeStatusSucceeded {
+		t.Fatalf("new commit blocked by leftover latest: %+v", got)
+	}
+	if got.PreviousCommitID != a {
+		t.Fatalf("rollback baseline was not the live latest: %+v", got)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != c || link != c || st.RecoveryRequired {
+		t.Fatalf("after realign: %+v %s", st, link)
+	}
+}
+
+func TestSameCommitRepublishesWhenLatestDiverged(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	f.apply(b)
+	latest := filepath.Join(f.cfg.Targets[0].Dir, "latest")
+	if e := os.Remove(latest); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.Symlink(a, latest); e != nil {
+		t.Fatal(e)
+	}
+	got := f.r.Apply(context.Background(), f.request(b))
+	if got.Status != release.NodeStatusSucceeded {
+		t.Fatalf("same commit blocked by leftover latest: %+v", got)
+	}
+	if got.PreviousCommitID != a || got.CommitID != b {
+		t.Fatalf("did not publish requested commit from live baseline: %+v", got)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != b || link != b || st.RecoveryRequired {
+		t.Fatalf("after republish: %+v %s", st, link)
 	}
 }
 func TestCleanupProtectsPreviousAndWarnsAfterSuccess(t *testing.T) {

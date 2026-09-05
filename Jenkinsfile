@@ -195,6 +195,7 @@ pipeline {
               try {
                 sh(script: """
                 set -eu
+                rm -f "nginx-test-response-${index}.json" "nginx-test-http-${index}.txt"
                 node_id="\$(cat "release-node-${index}.txt")"
                 state="\$(cat "release-status-${index}.txt")"
                 if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -t。"; exit 0; fi
@@ -219,7 +220,7 @@ pipeline {
                 echo '=============================================='
                 """)
               } finally {
-                if (fileExists("nginx-test-response-${index}.json")) {
+                if (fileExists("release-status-${index}.txt") && readFile("release-status-${index}.txt").trim() != 'skipped' && fileExists("nginx-test-response-${index}.json")) {
                   showReleaseLog('nginx -t 配置检测', "${env.RELEASE_TYPE}:${env.RELEASE_SERVER_NAME}",
                     fileExists("release-node-${index}.txt") ? readFile("release-node-${index}.txt").trim() : env.RELEASE_NODE_URL,
                     fileExists("nginx-test-http-${index}.txt") ? readFile("nginx-test-http-${index}.txt").trim() : '-',
@@ -244,6 +245,7 @@ pipeline {
               try {
                 sh(script: """
                 set -eu
+                rm -f "nginx-reload-response-${index}.json" "nginx-reload-http-${index}.txt"
                 node_id="\$(cat "release-node-${index}.txt")"
                 state="\$(cat "release-status-${index}.txt")"
                 if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -s reload。"; exit 0; fi
@@ -267,7 +269,7 @@ pipeline {
                 echo '=============================================='
                 """)
               } finally {
-                if (fileExists("nginx-reload-response-${index}.json")) {
+                if (fileExists("release-status-${index}.txt") && readFile("release-status-${index}.txt").trim() != 'skipped' && fileExists("nginx-reload-response-${index}.json")) {
                   showReleaseLog('nginx -s reload 与生效验证', "${env.RELEASE_TYPE}:${env.RELEASE_SERVER_NAME}",
                     fileExists("release-node-${index}.txt") ? readFile("release-node-${index}.txt").trim() : env.RELEASE_NODE_URL,
                     fileExists("nginx-reload-http-${index}.txt") ? readFile("nginx-reload-http-${index}.txt").trim() : '-',

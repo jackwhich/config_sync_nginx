@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"nginx_updata_config/internal/config"
+	"nginx_updata_config/internal/domain/release"
 )
 
 func TestExtractRejectsUnsafeEntriesAndHonorsLimits(t *testing.T) {
@@ -70,6 +71,9 @@ func TestRealGitArchivePAXAndRejectedPipeDoesNotHang(t *testing.T) {
 	run("add", ".")
 	run("commit", "-m", "initial")
 	commit := run("rev-parse", "HEAD")
+	// Make the local upload-pack advertise partial-clone filtering. This lets
+	// Checkout prove that archive can retrieve required blobs on demand.
+	run("config", "uploadpack.allowFilter", "true")
 	data := t.TempDir()
 	c := Client{DataDir: data, Repos: map[string]config.Repo{"config": {URL: "file://" + repo, AllowLocal: true, AllowedBranches: []string{"main"}}}, MaxBytes: 10 << 20, MaxFiles: 100}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -84,6 +88,13 @@ func TestRealGitArchivePAXAndRejectedPipeDoesNotHang(t *testing.T) {
 	}
 	if _, e = os.Stat(filepath.Join(work, "site", "config")); e != nil {
 		t.Fatal(e)
+	}
+	repoDir := filepath.Join(data, "repos", release.Digest([]string{"config", "file://" + repo})+".git")
+	if got := runGit(t, "--git-dir="+repoDir, "config", "--get", "remote.origin.promisor"); got != "true" {
+		t.Fatalf("partial clone promisor = %q, want true", got)
+	}
+	if got := runGit(t, "--git-dir="+repoDir, "config", "--get", "remote.origin.partialclonefilter"); got != "blob:none" {
+		t.Fatalf("partial clone filter = %q, want blob:none", got)
 	}
 	if _, _, e = c.Checkout(ctx, "config", "other", commit, "site"); e == nil {
 		t.Fatal("unlisted branch accepted")
@@ -106,4 +117,14 @@ func TestRealGitArchivePAXAndRejectedPipeDoesNotHang(t *testing.T) {
 	if time.Since(started) > 3*time.Second {
 		t.Fatal("archive pipe stalled instead of closing/killing producer")
 	}
+}
+
+func runGit(t *testing.T, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, b)
+	}
+	return strings.TrimSpace(string(b))
 }

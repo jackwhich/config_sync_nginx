@@ -81,7 +81,7 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
 
 Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。
 
-Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch` 传入，服务验证提交位于该分支历史中。默认配置只填写仓库 URL 和凭据。高级可选项 `allowed_branches` 是额外的分支允许列表，不代替请求 branch；未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
+Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch` 传入，服务验证提交位于该分支历史中。默认配置只填写仓库 URL 和凭据。拉取使用 Git partial clone 的 `blob:none` 过滤：先获取分支的提交和目录元数据，`git archive` 仅按需取回当前站点目录的文件；不支持该协议的 GitLab 自动退回普通 fetch。高级可选项 `allowed_branches` 是额外的分支允许列表，不代替请求 branch；未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 
 发布流程为：拉取 → 校验文件 → 建立完整 SHA 快照 → 原子切换 latest → `nginx -t` → `nginx -s reload` → 校验本地快照（及可选 HTTP 探测）→ 提交状态。检查或 reload 命令失败时恢复旧链接，再执行 `nginx -t`，通过后 reload；恢复失败则阻止后续发布。默认成功结果的 `activation_status` 为 `reload_requested`，表示文件就位且命令成功，不代表检查过 worker 或业务响应。
 

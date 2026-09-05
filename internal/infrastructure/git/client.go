@@ -66,11 +66,20 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	} else if err != nil {
 		return "", "", err
 	}
+	// Keep a promisor remote so a filtered fetch transfers commits and trees
+	// first, then git archive retrieves only blobs required by the requested
+	// site directory. The release request remains pinned and reachability is
+	// still checked against the named branch below.
+	if err = ensurePartialRemote(run, repoDir, repo.URL); err != nil {
+		return "", "", err
+	}
 	refspec := "+" + ref + ":" + ref
 	if branch == "" {
 		refspec = "+refs/heads/*:refs/heads/*"
 	}
-	if _, err = run("--git-dir="+repoDir, "fetch", "--prune", "--force", "--no-tags", repo.URL, refspec); err != nil {
+	// Git servers without partial-clone support ignore the filter and perform
+	// a normal fetch, preserving compatibility with older GitLab instances.
+	if _, err = run("--git-dir="+repoDir, "fetch", "--filter=blob:none", "--prune", "--force", "--no-tags", "origin", refspec); err != nil {
 		return "", "", err
 	}
 	kind, err := run("--git-dir="+repoDir, "cat-file", "-t", commit)
@@ -111,14 +120,34 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 		return "", "", err
 	}
 	dest := filepath.Join(c.DataDir, rel)
-	if err = c.extract(ctx, repoDir, actual, site, dest); err != nil {
+	if err = c.extract(ctx, repoDir, actual, site, dest, env, secrets); err != nil {
 		_ = data.RemoveAll(rel)
 		return "", "", err
 	}
 	return dest, actual, nil
 }
-func (c Client) extract(ctx context.Context, repoDir, commit, site, dest string) error {
+func ensurePartialRemote(run func(...string) (string, error), repoDir, repositoryURL string) error {
+	const remote = "origin"
+	current, err := run("--git-dir="+repoDir, "remote", "get-url", remote)
+	if err != nil {
+		if _, err = run("--git-dir="+repoDir, "remote", "add", remote, repositoryURL); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(current) != repositoryURL {
+		if _, err = run("--git-dir="+repoDir, "remote", "set-url", remote, repositoryURL); err != nil {
+			return err
+		}
+	}
+	if _, err = run("--git-dir="+repoDir, "config", "remote."+remote+".promisor", "true"); err != nil {
+		return err
+	}
+	_, err = run("--git-dir="+repoDir, "config", "remote."+remote+".partialclonefilter", "blob:none")
+	return err
+}
+
+func (c Client) extract(ctx context.Context, repoDir, commit, site, dest string, env, secrets []string) error {
 	cmd := process.Command(ctx, "git", "--git-dir="+repoDir, "archive", "--format=tar", commit, site)
+	cmd.Env = append(os.Environ(), env...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -146,7 +175,13 @@ func (c Client) extract(ctx context.Context, repoDir, commit, site, dest string)
 		return extractErr
 	}
 	if waitErr != nil {
-		return fmt.Errorf("git archive: %w: %s", waitErr, stderr.String())
+		message := stderr.String()
+		for _, secret := range secrets {
+			if secret != "" {
+				message = strings.ReplaceAll(message, secret, "[redacted]")
+			}
+		}
+		return fmt.Errorf("git archive: %w: %s", waitErr, message)
 	}
 	return nil
 }

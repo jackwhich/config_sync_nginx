@@ -34,11 +34,14 @@ repos:
   config:
     url: https://gitlab.example.com/ops/nginx-vhosts.git
     gitlab_token: replace-with-read-repository-token
+    # 默认使用 Git partial clone（blob:none）：先取提交/目录，发布时按需取本站点文件。
+    # 不支持该协议的 GitLab 会自动退回常规 fetch。
     # 可选的分支允许列表，不指定本次发布分支；实际分支由 POST 顶层 branch 传入。
     allowed_branches: [uat]
   whitelist:
     url: https://gitlab.example.com/ops/nginx-whitelist.git
     gitlab_token: replace-with-read-repository-token
+    # 同上；不需要为此把 Token 写入 Jenkinsfile。
     # 可选的分支允许列表，不指定本次发布分支；实际分支由 POST 顶层 branch 传入。
     allowed_branches: [uat]
 targets:

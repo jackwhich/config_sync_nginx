@@ -72,7 +72,7 @@ pipeline {
             urls.each { url ->
               env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
               echo "发布 ${env.RELEASE_NODE_URL}  type=${env.RELEASE_TYPE} server_name=${env.RELEASE_SERVER_NAME} commit=${env.RELEASE_COMMIT}"
-              sh '''
+              def code = sh(script: '''
                 set -eu
                 node="$RELEASE_NODE_URL"
                 echo "GET $node/healthz"
@@ -86,11 +86,35 @@ pipeline {
                   -H 'Content-Type: application/json' \
                   -H "X-Release-Token: $RELEASE_TOKEN" \
                   --data-binary @release-request.json)"
-                cat apply-response.json
-                echo
-                echo "HTTP $code"
-                test "$code" = 200
-              '''
+                printf '%s' "$code"
+              ''', returnStdout: true).trim()
+
+              def responseText = readFile('apply-response.json')
+              def response
+              try {
+                response = new groovy.json.JsonSlurperClassic().parseText(responseText)
+              } catch (Exception ignored) {
+                echo "发布响应不是有效 JSON：\n${responseText}"
+                error("HTTP ${code}，无法解析节点发布响应")
+              }
+
+              echo '========== Nginx 关键执行日志 =========='
+              echo "node=${env.RELEASE_NODE_URL}  release_id=${response.release_id ?: '-'}"
+              def nginxSteps = (response.steps ?: []).findAll { step -> step.name in ['nginx_test', 'reload'] }
+              if (nginxSteps.isEmpty()) {
+                echo '节点响应中没有 nginx_test / reload 步骤。'
+              } else {
+                nginxSteps.each { step ->
+                  echo "[${step.name}] status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
+                  echo(step.message ?: '(命令没有返回标准输出)')
+                }
+              }
+              echo '=========================================='
+              echo "发布结果：status=${response.status ?: '-'} activation=${response.activation_status ?: '-'} HTTP ${code}"
+              if (code != '200') {
+                echo "完整发布响应：\n${groovy.json.JsonOutput.prettyPrint(responseText)}"
+                error("节点发布失败，HTTP ${code}")
+              }
             }
           }
         }

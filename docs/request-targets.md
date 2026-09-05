@@ -90,7 +90,7 @@ nginx -t
 nginx -s reload
 ```
 
-`POST /api/v1/releases/apply` 只负责同步来源、校验候选快照并原子切换 `latest`。成功后返回 HTTP 202，状态为 `running`、阶段为 `awaiting_nginx_test`；此时发布还没有完成，且节点拒绝其他发布。
+`POST /api/v1/releases/apply` 只负责同步来源、校验候选快照并原子切换 `latest`。这是一个已完成的 Git 操作，成功后返回 HTTP 200、`status: succeeded`、阶段 `latest_switched`。它不把节点置为等待或暂停状态。
 
 发布方必须使用同一个 `release_id` 再依次调用以下接口。二者均使用和 apply 相同的 `X-Release-Token`：
 
@@ -103,10 +103,12 @@ X-Release-Token: <uat 对应的 Token>
 {"env":"uat","release_id":"<apply 返回的 release_id>"}
 ```
 
-- `nginx/test` 只在 `latest` 已切换且阶段为 `awaiting_nginx_test` 时执行 `nginx -t`。通过后返回 HTTP 202、阶段 `awaiting_nginx_reload`。
-- `nginx/reload` 只接受已通过检测的同一 release，执行 `nginx -s reload`、验证候选快照并提交状态；成功才返回 HTTP 200、`status: succeeded`。
-- `POST /api/v1/releases/abort` 使用相同的 `{env, release_id}` 请求体，只接受仍在等待 Nginx 命令的 release。它恢复原来的 `latest` 并检查、reload 旧配置；Jenkins 在自身异常时调用它，防止候选版本长期停在 `latest`。
-- 任一命令失败，服务立即恢复本机原来的 `latest`，对旧配置执行 `nginx -t` 和 reload；不重新拉取 Git 或 Harbor。服务在两个命令之间重启，也会按同样的恢复流程处理，而不会把未检测的候选配置保留为已发布版本。
+- `nginx/test` 对该次 Git 切换执行 `nginx -t`。通过后返回 HTTP 200、阶段 `nginx_test_succeeded`。
+- `nginx/reload` 只接受已通过检测的同一 release，执行 `nginx -s reload`、验证候选快照；成功返回 HTTP 200、阶段 `complete`。
+- `POST /api/v1/releases/abort` 可由运维人员显式使用相同的 `{env, release_id}` 请求体回滚一个尚未 reload 的 Git 切换；Jenkins 不会因为自身脚本失败而自动调用它。
+- 任一 Nginx 命令失败，服务立即恢复该次 Git 切换前的 `latest`，对旧配置执行 `nginx -t` 和 reload；不重新拉取 Git 或 Harbor。
+
+`/healthz` 只反映服务进程自身是否可用，不依据发布记录、Nginx 步骤或待处理的 release 改变结果。新的 Git 同步不会自动取消、暂停或回滚上一条发布记录；已不是当前 `latest` 的旧 release 再执行 Nginx 命令会明确返回冲突，且不会改动文件。
 
 服务配置不再接受 nginx 块。不读取 PID、不扫描进程、不解析启动参数、不检查 master/worker、不发送自行构造的 HUP，不安装、启动或停止 Nginx。已有 Nginx 主配置、include/root 由现有运维方式维护。
 
@@ -153,6 +155,6 @@ restore_of 撤销批次仍要求 expected_state_revision，以确认没有其他
 
 reload 失败的错误码为 `NGINX_RELOAD_FAILED`。若旧配置检查或恢复 reload 也失败，返回 HTTP 503、`status: recovery_required`、`error_code: RECOVERY_FAILED`；error 同时保留原始失败和恢复失败详情，目标禁止继续发布。
 
-`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。它会对每台节点依次发出 apply、nginx/test、nginx/reload 请求。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 只发布 config/whitelist：先显式检出配置的 GitLab 制品仓库，再用 curl 直连节点，依次期待 HTTP 202、202、200。任一步未返回预期状态即打印响应体并失败，避免把 HTTP 500 当成脚本成功。
+`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。它会对每台节点依次发出 apply、nginx/test、nginx/reload 请求。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 只发布 config/whitelist：先显式检出配置的 GitLab 制品仓库，再用 curl 直连节点，三个动作都期待 HTTP 200。任一步未返回预期状态即打印响应体并失败，避免把 HTTP 500 当成脚本成功。
 
 配置/白名单 Jenkins 参数与 HTTP 字段映射见 [Jenkins 发布说明](jenkins.md)。

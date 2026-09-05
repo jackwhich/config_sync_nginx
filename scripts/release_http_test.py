@@ -35,7 +35,7 @@ class FakeHTTP:
     def call(self, base, path, body=None):
         node = self.nodes[base]
         if path == "/healthz":
-            return 200, {"release_contract": 1 if base == self.old_contract else 2, "node_id": base[-1], "env": "test", "publish_ready": True, "capabilities": self.capabilities}
+            return 200, {"release_contract": 1 if base == self.old_contract else 2, "status": "ok", "node_id": base[-1], "env": "test", "publish_ready": True, "capabilities": self.capabilities}
         if body is None:
             query = parse_qs(urlsplit(path).query)
             release_id = query.get("release_id", [None])[0]
@@ -58,13 +58,14 @@ class FakeHTTP:
             if path.endswith("/test"):
                 if base == self.fail_node and not record["restore"]:
                     result.update(self.failure, status="failed", rollback_status="succeeded")
+                    node["commit"] = record["baseline"]["commit_id"]
                     node["revision"] = str(uuid.uuid4())
                     result["state_revision_after"] = node["revision"]
                     return 500, result
-                result.update(status="running", phase="awaiting_nginx_reload", activation_status="nginx_test_passed")
-                return 202, result
-            if result.get("phase") != "awaiting_nginx_reload":
-                return 409, {"error_code": "NGINX_RELOAD_NOT_PENDING"}
+                result.update(status="succeeded", phase="nginx_test_succeeded", activation_status="nginx_test_passed")
+                return 200, result
+            if result.get("phase") != "nginx_test_succeeded":
+                return 409, {"error_code": "NGINX_RELOAD_NOT_AVAILABLE"}
             node["commit"] = record["candidate"]
             node["revision"] = str(uuid.uuid4())
             result.update(status="succeeded", phase="complete", activation_status="reload_requested", state_revision_after=node["revision"])
@@ -72,15 +73,16 @@ class FakeHTTP:
         if body["expected_state_revision"] != node["revision"]:
             return 409, {"error_code": "STATE_REVISION_CONFLICT"}
         before = node["commit"]
-        result = {"release_id": body["release_id"], "state_revision_before": node["revision"], "commit_id": body["commit_id"], "status": "running", "phase": "awaiting_nginx_test", "activation_status": "latest_switched"}
+        result = {"release_id": body["release_id"], "state_revision_before": node["revision"], "commit_id": body["commit_id"], "status": "succeeded", "phase": "latest_switched", "activation_status": "latest_switched"}
         if body["type"] == "frontend_static":
             result["artifact_digest"] = body.get("artifact_digest", self.digest_by_node[base])
         result["state_revision_after"] = node["revision"]
         node["records"][body["release_id"]] = {"release": result, "candidate": body["commit_id"], "restore": "restore_of" in body, "baseline": {"commit_id": before, "version": before, "artifact_digest": "sha256:" + before[0] * 64}}
+        node["commit"] = body["commit_id"]
         if self.drop_reply:
             self.drop_reply = False
             raise client.ReleaseError("response lost")
-        return 202, result
+        return 200, result
 
 
 def batch(http):

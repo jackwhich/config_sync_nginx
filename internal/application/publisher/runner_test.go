@@ -274,20 +274,23 @@ func TestStagedNginxCommandsActivateOnlyAfterReload(t *testing.T) {
 	f.apply(a)
 	b := f.commit("B")
 	staged := f.r.Stage(context.Background(), f.request(b))
-	if staged.Status != release.NodeStatusRunning || staged.HTTPStatus != 202 || staged.Phase != "awaiting_nginx_test" {
+	if staged.Status != release.NodeStatusSucceeded || staged.HTTPStatus != 200 || staged.Phase != "latest_switched" {
 		t.Fatal(staged)
 	}
+	if f.r.Health()["publish_ready"] != true {
+		t.Fatal("a staged release made the node unready")
+	}
 	st, link := f.current()
-	if st.Current.CommitID != a || st.ActiveID != staged.ReleaseID || link != b {
+	if st.Current.CommitID != b || st.ActiveID != "" || link != b {
 		t.Fatalf("stage state = %+v link=%q", st, link)
 	}
 	command := release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID}
 	tested := f.r.NginxTest(context.Background(), command)
-	if tested.Status != release.NodeStatusRunning || tested.HTTPStatus != 202 || tested.Phase != "awaiting_nginx_reload" {
+	if tested.Status != release.NodeStatusSucceeded || tested.HTTPStatus != 200 || tested.Phase != "nginx_test_succeeded" {
 		t.Fatal(tested)
 	}
 	st, link = f.current()
-	if st.Current.CommitID != a || st.ActiveID != staged.ReleaseID || link != b {
+	if st.Current.CommitID != b || st.ActiveID != "" || link != b {
 		t.Fatalf("test state = %+v link=%q", st, link)
 	}
 	activated := f.r.NginxReload(context.Background(), command)
@@ -300,13 +303,40 @@ func TestStagedNginxCommandsActivateOnlyAfterReload(t *testing.T) {
 	}
 }
 
+func TestNewStageDoesNotPausePublication(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	first := f.r.Stage(context.Background(), f.request(b))
+	if first.Status != release.NodeStatusSucceeded || first.Phase != "latest_switched" {
+		t.Fatal(first)
+	}
+	c := f.commit("C")
+	next := f.r.Stage(context.Background(), f.request(c))
+	if next.Status != release.NodeStatusSucceeded || next.Phase != "latest_switched" {
+		t.Fatal(next)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != c || link != c {
+		t.Fatalf("new stage did not become current: %+v link=%q", st, link)
+	}
+	previous := st.Records[first.ReleaseID].Result
+	if previous.Status != release.NodeStatusSucceeded || previous.Phase != "latest_switched" {
+		t.Fatalf("first Git action was changed by the next action: %+v", previous)
+	}
+	if old := f.r.NginxTest(context.Background(), release.NginxCommandRequest{Env: "test", ReleaseID: first.ReleaseID}); old.ErrorCode != "RELEASE_NOT_CURRENT" {
+		t.Fatalf("stale command should be rejected without rollback: %+v", old)
+	}
+}
+
 func TestStagedNginxTestFailureRestoresBaseline(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
 	b := f.commit("B")
 	staged := f.r.Stage(context.Background(), f.request(b))
-	if staged.Status != release.NodeStatusRunning {
+	if staged.Status != release.NodeStatusSucceeded {
 		t.Fatal(staged)
 	}
 	calls := 0
@@ -334,7 +364,7 @@ func TestStagedNginxReloadFailureRestoresBaseline(t *testing.T) {
 	b := f.commit("B")
 	staged := f.r.Stage(context.Background(), f.request(b))
 	command := release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID}
-	if tested := f.r.NginxTest(context.Background(), command); tested.Status != release.NodeStatusRunning {
+	if tested := f.r.NginxTest(context.Background(), command); tested.Status != release.NodeStatusSucceeded {
 		t.Fatal(tested)
 	}
 	calls := 0
@@ -361,7 +391,7 @@ func TestAbortStagedReleaseRestoresBaseline(t *testing.T) {
 	f.apply(a)
 	b := f.commit("B")
 	staged := f.r.Stage(context.Background(), f.request(b))
-	if staged.Status != release.NodeStatusRunning || staged.Phase != "awaiting_nginx_test" {
+	if staged.Status != release.NodeStatusSucceeded || staged.Phase != "latest_switched" {
 		t.Fatal(staged)
 	}
 	aborted := f.r.Abort(context.Background(), release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID})
@@ -374,22 +404,22 @@ func TestAbortStagedReleaseRestoresBaseline(t *testing.T) {
 	}
 }
 
-func TestRestartWhileAwaitingNginxCommandRestoresBaseline(t *testing.T) {
+func TestRestartAfterGitStageKeepsCompletedGitAction(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
 	b := f.commit("B")
 	staged := f.r.Stage(context.Background(), f.request(b))
-	if staged.Status != release.NodeStatusRunning || staged.Phase != "awaiting_nginx_test" {
+	if staged.Status != release.NodeStatusSucceeded || staged.Phase != "latest_switched" {
 		t.Fatal(staged)
 	}
 	f.restart()
 	st, link := f.current()
-	if st.Current.CommitID != a || st.ActiveID != "" || st.RecoveryRequired || link != a {
-		t.Fatalf("restart did not restore baseline: %+v link=%q", st, link)
+	if st.Current.CommitID != b || st.ActiveID != "" || st.RecoveryRequired || link != b {
+		t.Fatalf("restart changed completed Git action: %+v link=%q", st, link)
 	}
-	if got := st.Records[staged.ReleaseID].Result; got.Status != release.NodeStatusFailed || got.ErrorCode != "INTERRUPTED" || got.RollbackStatus != "succeeded" {
-		t.Fatalf("pending release result = %+v", got)
+	if got := st.Records[staged.ReleaseID].Result; got.Status != release.NodeStatusSucceeded || got.Phase != "latest_switched" {
+		t.Fatalf("Git stage result = %+v", got)
 	}
 }
 
@@ -488,8 +518,8 @@ func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
 	if got.Status != release.NodeStatusRecoveryRequired || got.HTTPStatus != 503 {
 		t.Fatalf("%+v", got)
 	}
-	if f.r.Health()["publish_ready"] != false {
-		t.Fatal("unhealthy node allowed publication")
+	if f.r.Health()["publish_ready"] != true {
+		t.Fatal("a stored release outcome changed service health")
 	}
 	if got = f.r.Apply(context.Background(), f.request(b)); got.HTTPStatus != 503 {
 		t.Fatalf("new work accepted: %+v", got)
@@ -615,8 +645,8 @@ func TestUnknownExistingTargetIsNotAdopted(t *testing.T) {
 		t.Fatal(e)
 	}
 	f.r = r
-	if r.Health()["publish_ready"] != false {
-		t.Fatal("legacy files silently adopted")
+	if r.Health()["publish_ready"] != true {
+		t.Fatal("unmanaged release files changed service health")
 	}
 }
 func TestInterruptedPreparationBecomesFailed(t *testing.T) {

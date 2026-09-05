@@ -84,7 +84,7 @@ Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 
 
 Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch` 传入，服务验证提交位于该分支历史中。默认配置只填写仓库 URL 和凭据。拉取优先使用 Git partial clone 的 `blob:none` 过滤：先获取分支的提交和目录元数据，`git archive` 仅按需取回当前站点目录的文件；GitLab 或节点 Git 客户端不支持该协议时，会自动退回普通 fetch。高级可选项 `allowed_branches` 是额外的分支允许列表，不代替请求 branch；未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 
-发布流程为：`POST /apply` 拉取 → 校验文件 → 建立完整 SHA 快照 → 原子切换 latest（HTTP 202）→ `POST /nginx/test` 执行 `nginx -t`（HTTP 202）→ `POST /nginx/reload` 执行 reload、校验本地快照及可选 HTTP 探测（HTTP 200）→ 提交状态。检查或 reload 命令失败时恢复旧链接，再执行旧配置的 `nginx -t`，通过后 reload；服务在等待 Nginx 命令时重启也恢复旧链接。恢复失败则阻止后续发布。默认成功结果的 `activation_status` 为 `reload_requested`，表示文件就位且命令成功，不代表检查过 worker 或业务响应。
+发布流程为三个独立、均已完成的 HTTP 动作：`POST /apply` 拉取 → 校验文件 → 建立完整 SHA 快照 → 原子切换 latest（HTTP 200）；`POST /nginx/test` 执行 `nginx -t`（HTTP 200）；`POST /nginx/reload` 执行 reload、校验本地快照及可选 HTTP 探测（HTTP 200）。检查或 reload 命令失败时恢复该次 Git 切换前的旧链接，再执行旧配置的 `nginx -t`，通过后 reload。健康检查只反映服务自身是否可访问，不因某条发布记录或 Nginx 步骤改变。默认成功结果的 `activation_status` 为 `reload_requested`，表示文件就位且命令成功，不代表检查过 worker 或业务响应。
 
 `nginx -t` 接口失败返回 HTTP 500、`error_code: NGINX_TEST_FAILED` 和命令输出；reload 接口失败返回 `NGINX_RELOAD_FAILED`。恢复失败返回 HTTP 503、`RECOVERY_FAILED`，保留原始错误和恢复错误。批量客户端输出这些详情，以退出码 1 结束，Jenkins 的 `sh` 步骤随即失败，后续节点不继续发布。详见 [错误响应与 Jenkins](docs/request-targets.md#错误响应与-jenkins)。
 
@@ -96,10 +96,10 @@ Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch`
 | --- | --- |
 | `GET /healthz` | 协议能力、node_id、publish_ready、busy |
 | `GET /api/v1/releases/state` | 目标当前状态，或按 release_id 查询历史结果 |
-| `POST /api/v1/releases/apply` | 同步、校验、切换 latest；成功暂挂时返回 HTTP 202 |
-| `POST /api/v1/releases/nginx/test` | 对指定暂挂 release_id 执行 nginx -t；成功后返回 HTTP 202 |
+| `POST /api/v1/releases/apply` | 同步、校验、切换 latest；成功返回 HTTP 200 |
+| `POST /api/v1/releases/nginx/test` | 对指定 release_id 执行 nginx -t；成功返回 HTTP 200 |
 | `POST /api/v1/releases/nginx/reload` | 对已通过检测的 release_id 执行 reload 与生效验证；成功后返回 HTTP 200 |
-| `POST /api/v1/releases/abort` | Jenkins 在阶段异常时取消暂挂 release，并恢复原 latest |
+| `POST /api/v1/releases/abort` | 可显式回滚尚未 reload 的 Git 切换 |
 | `GET /metrics` | 有限维度的 Prometheus 指标 |
 
 apply、nginx/test、nginx/reload、abort、state 使用 `X-Release-Token`。Nginx 命令和 abort 接口请求体只包含 `env` 和 `/apply` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
@@ -112,7 +112,7 @@ apply、nginx/test、nginx/reload、abort、state 使用 `X-Release-Token`。Ngi
 
 省略 release_id 时服务生成 UUID，响应返回该 ID；需要可重试操作时，应由调用方预先生成并保存 release_id。省略 expected_state_revision 时在节点锁内使用当前状态；需要防止过时请求覆盖后续发布时，使用下面的完整流程。简化请求要求 healthz capabilities 包含 `request_targets_v1`。
 
-先检查 `/healthz`：`release_contract` 必须等于 2，`publish_ready` 必须为 true。前端还要求 `capabilities` 包含 `frontend_oras_v1`。老服务缺少该字段时客户端停止。再查询目标并保存 `target_id`、`state_revision`：
+先检查 `/healthz`：`release_contract` 必须等于 2，且服务状态为 `ok`。前端还要求 `capabilities` 包含 `frontend_oras_v1`。老服务缺少该字段时客户端停止。再查询目标并保存 `target_id`、`state_revision`：
 
 ```bash
 curl --get "$RELEASE_URL/api/v1/releases/state" \
@@ -143,9 +143,9 @@ curl --get "$RELEASE_URL/api/v1/releases/state" \
 
 示例中的 ID 和 commit 为占位值。请求体必须只有一个 JSON 对象，拒绝未知字段和超限请求。`source_repo` 可省略；填写时必须与 type 相同。
 
-同一 release_id、相同规范化参数会重放记录；同一 ID 参数变化返回 409。运行中返回 409，待恢复返回 503。状态修订号冲突也返回 409，防止覆盖后续发布，包括 A→B→A 的情况。
+同一 release_id、相同规范化参数会重放记录；同一 ID 参数变化返回 409。并发请求返回 409，状态修订号冲突也返回 409，防止覆盖后续发布，包括 A→B→A 的情况。
 
-响应保留逐步耗时、`status`、`activation_status`、`rollback_status`、前后修订号及错误码。切换 latest 后等待 nginx -t、或 nginx -t 成功后等待 reload 时为 HTTP 202；最终成功或跳过为 200，执行失败为 500，状态不确定或恢复失败为 503。HTTP 超时不是失败结论，查询：
+响应保留逐步耗时、`status`、`activation_status`、`rollback_status`、前后修订号及错误码。三个独立动作成功或跳过均为 HTTP 200，执行失败为 500，状态不确定或恢复失败为 503。HTTP 超时不是失败结论，查询：
 
 ```text
 GET /api/v1/releases/state?env=uat&target_id=<目标 ID>&release_id=<原请求 UUID>
@@ -242,7 +242,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 1. 停止旧发布进程，保存旧配置、状态和所有生效快照。
 2. 根据新示例配置显式目标、节点身份、共享锁和生效检查，先运行 `-check-config`。
-3. 空部署目录可以初始化。已有文件或旧 latest 而没有可信新状态的目标显示 `publish_ready=false`，不会被覆盖。
+3. 空部署目录可以初始化。已有文件或旧 latest 而没有可信新状态的目标不会被覆盖；这不影响服务自身的健康检查结果。
 4. config/whitelist 可离线导入 `latest -> <完整 commit>` 的旧快照（相对链接，或指向本目标该子目录的绝对链接）：
 
 ```bash

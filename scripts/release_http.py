@@ -123,7 +123,7 @@ def preflight(http, urls, request):
     for url in urls:
         url = check_url(url)
         health = require(*http.call(url, "/healthz"))
-        if health.get("release_contract") != 2 or health.get("publish_ready") is not True:
+        if health.get("release_contract") != 2 or health.get("status") not in {None, "ok"}:
             raise ReleaseError(url + " is not ready for HTTP release contract 2")
         require_frontend_capability(health, request)
         node_id = health.get("node_id")
@@ -131,7 +131,7 @@ def preflight(http, urls, request):
             raise ReleaseError("duplicate/missing node_id or environment mismatch: " + url)
         seen.add(node_id)
         baseline = require(*http.call(url, state_path(request["env"], request=request)))
-        if baseline.get("recovery_required") or baseline.get("active_release_id") or baseline.get("node_id") != node_id:
+        if baseline.get("recovery_required") or baseline.get("node_id") != node_id:
             raise ReleaseError("node has unresolved state: " + url)
         if not baseline.get("state_revision") or not baseline.get("target_id"):
             raise ReleaseError("missing contract-2 state fields: " + url)
@@ -147,16 +147,16 @@ def identity(http, node, env):
         raise ReleaseError("endpoint identity or contract changed: " + node["url"])
 
 
-def activate_pending(http, batch, node, path, request, result, result_key):
-    """Advance a staged release through its explicit nginx command endpoints."""
-    while result.get("status") == "running":
+def activate_release(http, batch, node, path, request, result, result_key):
+    """Run the two completed Nginx actions after a completed Git switch."""
+    while result.get("phase") != "complete":
         phase = result.get("phase")
-        if phase == "awaiting_nginx_test":
-            endpoint, expected_phase, label = "/api/v1/releases/nginx/test", "awaiting_nginx_reload", "nginx_test"
-        elif phase == "awaiting_nginx_reload":
-            endpoint, expected_phase, label = "/api/v1/releases/nginx/reload", None, "nginx_reload"
+        if phase in {"latest_switched", "nginx_test"}:
+            endpoint, expected_phase, label = "/api/v1/releases/nginx/test", "nginx_test_succeeded", "nginx_test"
+        elif phase in {"nginx_test_succeeded", "reload", "verify_activation"}:
+            endpoint, expected_phase, label = "/api/v1/releases/nginx/reload", "complete", "nginx_reload"
         else:
-            raise ReleaseError("node returned an unknown pending release phase: " + str(phase))
+            raise ReleaseError("node returned an unknown release phase: " + str(phase))
         node[result_key] = result
         node["phase"] = label + "_sending"
         atomic_save(path, batch)
@@ -171,10 +171,7 @@ def activate_pending(http, batch, node, path, request, result, result_key):
         node[result_key] = response
         node["phase"] = label + "_complete"
         atomic_save(path, batch)
-        if response.get("status") == "running":
-            if code != 202 or response.get("phase") != expected_phase:
-                raise ReleaseError("unexpected pending nginx command response: HTTP %s: %s" % (code, failure_detail(response)))
-        elif response.get("status") not in TERMINAL and response.get("status") != "recovery_required":
+        if code != 200 or response.get("status") != "succeeded" or response.get("phase") != expected_phase:
             raise ReleaseError("unexpected nginx command response: HTTP %s: %s" % (code, failure_detail(response)))
         result = response
     return result
@@ -183,7 +180,7 @@ def activate_pending(http, batch, node, path, request, result, result_key):
 def execute_node(http, batch, node, path, key="request", result_key="result", resolve_timeout=120):
     request = node[key]
     result = node.get(result_key)
-    if result and result.get("status") in TERMINAL:
+    if result and (result.get("status") == "skipped" or result.get("phase") == "complete"):
         return result
     identity(http, node, batch["env"])
     deadline = time.monotonic() + resolve_timeout
@@ -195,18 +192,17 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
             result = live.get("release", {})
             if result.get("release_id") != request["release_id"]:
                 raise ReleaseError("state response release identity mismatch")
-            if result.get("status") in TERMINAL:
+            if result.get("status") in TERMINAL and (result.get("status") != "succeeded" or result.get("phase") == "complete"):
                 node[result_key] = result
                 node["phase"] = result_key + "_complete"
                 atomic_save(path, batch)
                 return result
-            if result.get("status") == "running":
-                result = activate_pending(http, batch, node, path, request, result, result_key)
-                if result.get("status") in TERMINAL:
-                    node[result_key] = result
-                    node["phase"] = result_key + "_complete"
-                    atomic_save(path, batch)
-                    return result
+            if result.get("status") == "succeeded" and result.get("phase") != "complete":
+                result = activate_release(http, batch, node, path, request, result, result_key)
+                node[result_key] = result
+                node["phase"] = result_key + "_complete"
+                atomic_save(path, batch)
+                return result
             if result.get("status") == "recovery_required":
                 node[result_key] = result
                 node["phase"] = "recovery_required"
@@ -225,15 +221,14 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
             else:
                 if response.get("release_id") not in {None, request["release_id"]}:
                     raise ReleaseError("POST response release identity mismatch")
-                if response.get("status") == "running":
-                    if status != 202 or response.get("phase") != "awaiting_nginx_test":
-                        raise ReleaseError("unexpected staged release response: HTTP %s: %s" % (status, failure_detail(response)))
-                    result = activate_pending(http, batch, node, path, request, response, result_key)
-                    if result.get("status") in TERMINAL:
-                        node[result_key] = result
-                        node["phase"] = result_key + "_complete"
-                        atomic_save(path, batch)
-                        return result
+                if response.get("status") == "succeeded" and response.get("phase") != "complete":
+                    if status != 200 or response.get("phase") != "latest_switched":
+                        raise ReleaseError("unexpected Git switch response: HTTP %s: %s" % (status, failure_detail(response)))
+                    result = activate_release(http, batch, node, path, request, response, result_key)
+                    node[result_key] = result
+                    node["phase"] = result_key + "_complete"
+                    atomic_save(path, batch)
+                    return result
                 # A terminal response is trusted only when tied to an accepted record.
                 if response.get("status") in TERMINAL and response.get("state_revision_before"):
                     node[result_key] = response

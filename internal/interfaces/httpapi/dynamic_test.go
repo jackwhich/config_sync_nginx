@@ -62,14 +62,14 @@ func TestMinimalHTTPPublishAndEnvironmentTokenBinding(t *testing.T) {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	rec := post("uat-token")
-	if rec.Code != 202 {
+	if rec.Code != 200 {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	var result release.Result
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != release.NodeStatusRunning || result.Phase != "awaiting_nginx_test" || result.Env != "uat" || !release.IsID(result.ReleaseID) {
+	if result.Status != release.NodeStatusSucceeded || result.Phase != "latest_switched" || result.Env != "uat" || !release.IsID(result.ReleaseID) {
 		t.Fatal(result)
 	}
 	command := func(path, token string) *httptest.ResponseRecorder {
@@ -80,7 +80,7 @@ func TestMinimalHTTPPublishAndEnvironmentTokenBinding(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
-	if rec := command("/api/v1/releases/nginx/test", "uat-token"); rec.Code != 202 {
+	if rec := command("/api/v1/releases/nginx/test", "uat-token"); rec.Code != 200 {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	rec = command("/api/v1/releases/nginx/reload", "uat-token")
@@ -113,7 +113,7 @@ func TestMinimalHTTPPublishAndEnvironmentTokenBinding(t *testing.T) {
 	run("commit", "-m", "next fixture")
 	body["commitid"] = run("rev-parse", "HEAD")
 	rec = post("uat-token")
-	if rec.Code != 202 {
+	if rec.Code != 200 {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {

@@ -82,7 +82,7 @@ pipeline {
                 health="\$(curl -sS --max-time 30 "\$node/healthz")"
                 printf '%s' "\$health" > "sync-health-${index}.json"
                 echo "\$health" | grep -Eq '"release_contract"[[:space:]]*:[[:space:]]*2' || { echo 'release_contract 必须为 2'; exit 1; }
-                echo "\$health" | grep -Eq '"publish_ready"[[:space:]]*:[[:space:]]*true' || { echo '节点 publish_ready 不为 true'; exit 1; }
+                echo "\$health" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' || { echo '节点健康检查未返回 ok'; exit 1; }
                 node_id="\$(sed -nE 's/.*"node_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-health-${index}.json" | head -n 1)"
                 test -n "\$node_id" || { echo '健康检查缺少 node_id'; exit 1; }
                 printf '%s\n' "\$node_id" > "release-node-${index}.txt"
@@ -101,14 +101,23 @@ pipeline {
                   echo '=============================================='
                   exit 0
                 fi
-                test "\$code" = 202 || { echo "同步接口应返回 HTTP 202，实际为 \$code"; exit 1; }
-                grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "sync-response-${index}.json" || { echo '同步响应 status 不是 running'; exit 1; }
-                grep -Eq '"phase"[[:space:]]*:[[:space:]]*"awaiting_nginx_test"' "sync-response-${index}.json" || { echo '同步响应未进入 awaiting_nginx_test'; exit 1; }
+                test "\$code" = 200 || { echo "同步接口应返回 HTTP 200，实际为 \$code"; exit 1; }
+                grep -Eq '"status"[[:space:]]*:[[:space:]]*"succeeded"' "sync-response-${index}.json" || { echo '同步响应 status 不是 succeeded'; exit 1; }
                 release_id="\$(sed -nE 's/.*"release_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-response-${index}.json" | head -n 1)"
                 echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '同步响应缺少合法 release_id'; exit 1; }
                 printf '%s\n' "\$release_id" > "release-id-${index}.txt"
-                printf '%s\n' waiting_test > "release-status-${index}.txt"
-                echo "Git 更新、快照准备和 latest 切换已完成；release_id=\$release_id"
+                phase="\$(sed -nE 's/.*"phase"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-response-${index}.json" | head -n 1)"
+                case "\$phase" in
+                  latest_switched|nginx_test)
+                    printf '%s\n' git_switched > "release-status-${index}.txt"
+                    echo "Git 更新、快照准备和 latest 切换完成；release_id=\$release_id"
+                    ;;
+                  nginx_test_succeeded|reload|verify_activation)
+                    printf '%s\n' nginx_test_succeeded > "release-status-${index}.txt"
+                    echo "Git 切换已完成；release_id=\$release_id，nginx -t 已完成或可安全重试 reload。"
+                    ;;
+                  *) echo "同步响应处于不支持的阶段：\$phase"; exit 1 ;;
+                esac
                 echo '=============================================='
               """)
             }
@@ -132,7 +141,7 @@ pipeline {
                 node_id="\$(cat "release-node-${index}.txt")"
                 state="\$(cat "release-status-${index}.txt")"
                 if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -t。"; exit 0; fi
-                test "\$state" = waiting_test || { echo "节点 \$node_id 不在等待 nginx -t 状态：\$state"; exit 1; }
+                test "\$state" = git_switched || { echo "节点 \$node_id 未完成 Git 切换：\$state"; exit 1; }
                 release_id="\$(cat "release-id-${index}.txt")"
                 echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '缺少合法 release_id'; exit 1; }
                 printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "nginx-test-request-${index}.json"
@@ -145,11 +154,11 @@ pipeline {
                   --data-binary @'nginx-test-request-${index}.json')"
                 echo "节点主机：\$node_id  release_id=\$release_id  HTTP \$code"
                 show_json "nginx-test-response-${index}.json"
-                test "\$code" = 202 || { echo "nginx -t 接口应返回 HTTP 202，实际为 \$code"; exit 1; }
-                grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "nginx-test-response-${index}.json" || { echo 'nginx -t 响应 status 不是 running'; exit 1; }
-                grep -Eq '"phase"[[:space:]]*:[[:space:]]*"awaiting_nginx_reload"' "nginx-test-response-${index}.json" || { echo 'nginx -t 未进入 awaiting_nginx_reload'; exit 1; }
-                printf '%s\n' waiting_reload > "release-status-${index}.txt"
-                echo 'nginx -t 检测完成，等待 reload。'
+                test "\$code" = 200 || { echo "nginx -t 接口应返回 HTTP 200，实际为 \$code"; exit 1; }
+                grep -Eq '"status"[[:space:]]*:[[:space:]]*"succeeded"' "nginx-test-response-${index}.json" || { echo 'nginx -t 响应 status 不是 succeeded'; exit 1; }
+                grep -Eq '"phase"[[:space:]]*:[[:space:]]*"nginx_test_succeeded"' "nginx-test-response-${index}.json" || { echo 'nginx -t 响应未完成'; exit 1; }
+                printf '%s\n' nginx_test_succeeded > "release-status-${index}.txt"
+                echo 'nginx -t 检测完成。'
                 echo '=============================================='
               """)
             }
@@ -173,7 +182,7 @@ pipeline {
                 node_id="\$(cat "release-node-${index}.txt")"
                 state="\$(cat "release-status-${index}.txt")"
                 if [ "\$state" = skipped ]; then echo "\$node_id 已是目标 commit，跳过 nginx -s reload。"; exit 0; fi
-                test "\$state" = waiting_reload || { echo "节点 \$node_id 不在等待 reload 状态：\$state"; exit 1; }
+                test "\$state" = nginx_test_succeeded || { echo "节点 \$node_id 未完成 nginx -t：\$state"; exit 1; }
                 release_id="\$(cat "release-id-${index}.txt")"
                 echo "\$release_id" | grep -Eq '^[0-9a-fA-F-]{36}\$' || { echo '缺少合法 release_id'; exit 1; }
                 printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "nginx-reload-request-${index}.json"
@@ -200,43 +209,6 @@ pipeline {
   }
   post {
     success { echo 'HTTP 发布完成。' }
-    failure {
-      withCredentials([string(credentialsId: env.RELEASE_CREDENTIAL_ID, variable: 'RELEASE_TOKEN')]) {
-        script {
-          def urls = env.RELEASE_URLS?.split(/[\s,]+/)?.findAll { it } ?: []
-          urls.eachWithIndex { url, index ->
-            env.RELEASE_NODE_URL = url.replaceAll(/\/+$/, '')
-            sh(script: """
-              set +e
-              status_file="release-status-${index}.txt"
-              id_file="release-id-${index}.txt"
-              if [ ! -f "\$status_file" ] || [ ! -f "\$id_file" ]; then
-                echo "未找到 \$RELEASE_NODE_URL 的暂挂发布记录，无需自动取消。"
-                exit 0
-              fi
-              state="\$(cat "\$status_file")"
-              if [ "\$state" != waiting_test ] && [ "\$state" != waiting_reload ]; then
-                echo "\$RELEASE_NODE_URL 当前状态为 \$state，无需自动取消。"
-                exit 0
-              fi
-              release_id="\$(cat "\$id_file")"
-              echo "流水线失败，自动恢复 \$RELEASE_NODE_URL 的 release_id=\$release_id"
-              printf '{"env":"%s","release_id":"%s"}' "\$RELEASE_ENV" "\$release_id" > "release-abort-request-${index}.json"
-              code="\$(curl -sS -o "release-abort-response-${index}.json" -w '%{http_code}' --max-time 120 \\
-                -X POST "\$RELEASE_NODE_URL/api/v1/releases/abort" \\
-                -H 'Content-Type: application/json' \\
-                -H "X-Release-Token: \$RELEASE_TOKEN" \\
-                --data-binary @"release-abort-request-${index}.json")"
-              echo "自动恢复接口 HTTP \$code"
-              if [ -f "release-abort-response-${index}.json" ]; then
-                if command -v python3 >/dev/null 2>&1; then python3 -m json.tool < "release-abort-response-${index}.json"; else cat "release-abort-response-${index}.json"; fi
-              fi
-              exit 0
-            """)
-          }
-        }
-      }
-      echo '发布失败，具体 Git、nginx -t、reload 及自动恢复结果见上方控制台。若节点仍为 recovery_required，请先恢复该节点再重新发布。'
-    }
+    failure { echo '发布失败，具体 Git、nginx -t、reload 及回滚结果见上方控制台。' }
   }
 }

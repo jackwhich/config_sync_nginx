@@ -23,9 +23,9 @@ Job 可以使用 Pipeline from SCM 读取本仓库的 `Jenkinsfile`；流水线�
 | `RELEASE_BRANCH`（默认 uat） | 顶层 branch |
 | environment 固定值 | env、project、path_dest、节点 URL、GitLab 地址及凭据 ID |
 
-Jenkins 界面中发布拆为三个独立阶段：`同步 Git 并切换 latest`、`nginx -t 配置检测`、`nginx -s reload 与生效验证`。每个节点先 `GET /healthz`，确认 `release_contract` 为 2 且 `publish_ready` 为 true；三个阶段再依次调用 `POST /api/v1/releases/apply`（预期 HTTP 202）、`POST /api/v1/releases/nginx/test`（预期 HTTP 202）、`POST /api/v1/releases/nginx/reload`（预期 HTTP 200）。阶段之间将节点地址、主机名和 apply 返回的 `release_id` 保存到工作区进度文件。后两个接口只提交 `env` 和该 `release_id`。
+Jenkins 界面中发布拆为三个独立阶段：`同步 Git 并切换 latest`、`nginx -t 配置检测`、`nginx -s reload 与生效验证`。每个节点先 `GET /healthz`，确认服务状态为 `ok` 且 `release_contract` 为 2；三个阶段依次调用 `POST /api/v1/releases/apply`、`POST /api/v1/releases/nginx/test`、`POST /api/v1/releases/nginx/reload`，三者成功均为 HTTP 200。阶段之间将节点地址、主机名和 apply 返回的 `release_id` 保存到工作区进度文件。后两个接口只提交 `env` 和该 `release_id`。
 
-同步接口若返回 HTTP 200 且 `status: skipped`，表示该节点已经是相同 commit_id；工作区的节点状态文件会标记该节点，后续 nginx -t 和 reload 两个阶段均明确跳过，不会重复执行命令。任一步失败即停止后续阶段；Nginx 检测、reload 或验证失败时，节点服务会恢复切换前的 latest。若 Jenkins 自身在阶段之间异常，`post failure` 会用记录的 release_id 调用 `/api/v1/releases/abort`，让节点立即恢复旧 latest，避免一直处于 `publish_ready: false`。
+同步接口若返回 HTTP 200 且 `status: skipped`，表示该节点已经是相同 commit_id 且此前已完成 reload；工作区的节点状态文件会标记该节点，后续 nginx -t 和 reload 两个阶段均明确跳过，不会重复执行命令。任一步失败即停止后续阶段；Nginx 检测、reload 或验证失败时，节点服务会恢复切换前的 latest。Jenkins 自身在阶段之间异常不会自动取消或暂停节点上的发布；下次发布可正常执行。
 
 Git 仓库位置不作为 Jenkins 请求参数；服务按 type 选择 repos.config 或 repos.whitelist。
 

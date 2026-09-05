@@ -201,18 +201,6 @@ func (r *Runner) Health() map[string]any {
 			verifiedAt = st.Current.VerifiedAt
 		}
 		prom.TargetState(st.Target.Env, string(st.Target.Type), st.Target.ID, st.RecoveryRequired, verifiedAt)
-		if st.RecoveryRequired {
-			ready = false
-			if reason == "" {
-				reason = "target requires recovery or explicit baseline migration"
-			}
-		}
-		if st.ActiveID != "" {
-			ready = false
-			if reason == "" {
-				reason = "release awaits nginx activation"
-			}
-		}
 	}
 	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
 	envs := []string{}
@@ -405,8 +393,9 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	return r.apply(ctx, req, false)
 }
 
-// Stage fetches and verifies a candidate, then switches latest. It leaves the
-// release active until NginxTest and NginxReload have completed.
+// Stage fetches and verifies a candidate, then switches latest. It is a
+// completed Git action: NginxTest and NginxReload are separate completed
+// actions which use this release's retained baseline if they need to roll back.
 func (r *Runner) Stage(ctx context.Context, req release.ApplyRequest) release.Result {
 	return r.apply(ctx, req, true)
 }
@@ -469,7 +458,7 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 	blocked := r.blocked
 	stopping := r.stopping
 	for _, s := range r.views {
-		if s.RecoveryRequired || s.ActiveID != "" {
+		if s.RecoveryRequired {
 			blocked = "node has unfinished work; restart for recovery"
 		}
 	}
@@ -533,6 +522,14 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
 	}
 	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == source {
+		for _, existing := range st.Records {
+			if existing.Candidate != nil && existing.Candidate.CommitID == req.CommitID && existing.Candidate.Source == source && existing.Result.Status == release.NodeStatusSucceeded && resumableNginxPhase(existing.Result.Phase) {
+				result := existing.Result
+				result.Replayed = true
+				result.HTTPStatus = http.StatusOK
+				return result
+			}
+		}
 		rec.Result.Status = release.NodeStatusSkipped
 		rec.Result.Phase = "complete"
 		rec.Result.FinishedAt = time.Now().UTC()
@@ -633,7 +630,7 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		return r.restore(t, st, rec, "ACTIVATION_FAILED", e)
 	}
 	if deferNginxCommands {
-		return r.awaitNginxCommand(st, rec, "awaiting_nginx_test", "latest_switched")
+		return r.commitGitStage(st, rec)
 	}
 	if e == nil {
 		e = r.stepWithOutput(critical, st, rec, "nginx_test", r.nginxTest)
@@ -659,6 +656,15 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		return r.restore(t, st, rec, "ACTIVATION_FAILED", e)
 	}
 	return r.commit(t, st, rec)
+}
+
+func resumableNginxPhase(phase string) bool {
+	switch phase {
+	case "latest_switched", "nginx_test", "nginx_test_succeeded", "reload", "verify_activation":
+		return true
+	default:
+		return false
+	}
 }
 func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Record, name string, fn func(context.Context) error) error {
 	return r.stepWithOutput(ctx, st, rec, name, func(c context.Context) (string, error) {
@@ -744,12 +750,25 @@ func commandOutput(output string, err error) string {
 	return output
 }
 
-func (r *Runner) awaitNginxCommand(st *state.TargetState, rec *state.Record, phase, activation string) release.Result {
-	rec.Result.Status = release.NodeStatusRunning
-	rec.Result.Phase = phase
-	rec.Result.ActivationStatus = activation
+// commitGitStage records a completed Git/snapshot switch.  It deliberately
+// leaves no active transaction behind: nginx -t and reload are independently
+// callable actions, while the recorded baseline remains available to either
+// action for rollback.
+func (r *Runner) commitGitStage(st *state.TargetState, rec *state.Record) release.Result {
+	st.Previous = rec.Baseline
+	st.Current = rec.Candidate
+	st.Revision = release.ID()
+	st.ActiveID = ""
+	st.RecoveryRequired = false
+	rec.Result.Status = release.NodeStatusSucceeded
+	rec.Result.Phase = "latest_switched"
+	rec.Result.ActivationStatus = "latest_switched"
 	rec.Result.RollbackStatus = "not_needed"
-	rec.HTTPStatus = http.StatusAccepted
+	rec.Result.ErrorCode = ""
+	rec.Result.Error = ""
+	rec.Result.StateRevisionAfter = st.Revision
+	rec.Result.FinishedAt = time.Now().UTC()
+	rec.HTTPStatus = http.StatusOK
 	if e := r.save(st); e != nil {
 		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
 	}
@@ -760,21 +779,20 @@ func nginxCommandReject(req release.NginxCommandRequest, code int, key, message 
 	return release.Result{ReleaseID: req.ReleaseID, Env: req.Env, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: message, HTTPStatus: code, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
 }
 
-// NginxTest runs nginx -t only for the active release that has already
-// switched latest through Stage. A failure restores the recorded baseline.
+// NginxTest runs nginx -t for a completed Git switch. A failure restores the
+// baseline that the switch recorded.
 func (r *Runner) NginxTest(ctx context.Context, req release.NginxCommandRequest) release.Result {
 	return r.runNginxCommand(ctx, req, "test")
 }
 
 // NginxReload runs nginx -s reload only after a successful NginxTest. It
-// verifies the activated configuration and commits the release on success.
+// verifies the activated configuration and finishes the Nginx action.
 func (r *Runner) NginxReload(ctx context.Context, req release.NginxCommandRequest) release.Result {
 	return r.runNginxCommand(ctx, req, "reload")
 }
 
-// Abort restores the baseline for an active release that is waiting for an
-// explicit Nginx command. Jenkins calls this after an unexpected pipeline
-// failure so a staged latest link is never left active indefinitely.
+// Abort is an explicit operator rollback for a Git switch that has not yet
+// completed reload. It never changes health or blocks a later publication.
 func (r *Runner) Abort(ctx context.Context, req release.NginxCommandRequest) release.Result {
 	return r.runNginxCommand(ctx, req, "abort")
 }
@@ -827,8 +845,8 @@ func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRe
 		return nginxCommandReject(req, http.StatusServiceUnavailable, "STATE_UNAVAILABLE", e.Error())
 	}
 	rec := st.Records[req.ReleaseID]
-	if rec == nil || st.ActiveID != req.ReleaseID || !rec.Intent || rec.Candidate == nil {
-		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_PENDING", "release is not awaiting an nginx command")
+	if rec == nil || !rec.Intent || rec.Candidate == nil {
+		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_FOUND", "release has no switched candidate")
 	}
 	env := st.Target.Env
 	if env == "" {
@@ -846,6 +864,9 @@ func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRe
 		return r.uncertain(st, rec, "TARGET_UNAVAILABLE", e)
 	}
 	defer base.Close()
+	if st.Current == nil || st.Current.CommitID != rec.Candidate.CommitID || st.Current.Source != rec.Candidate.Source {
+		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_CURRENT", "a newer Git switch is now current")
+	}
 	if link, e := fsutil.Link(base); e != nil || link != rec.Candidate.Link {
 		if e == nil {
 			e = fmt.Errorf("latest changed before nginx command")
@@ -856,22 +877,43 @@ func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRe
 	defer cancel()
 	switch command {
 	case "abort":
-		if rec.Result.Phase != "awaiting_nginx_test" && rec.Result.Phase != "awaiting_nginx_reload" {
-			return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_PENDING", "release is not awaiting an nginx command")
+		if rec.Result.Phase != "latest_switched" && rec.Result.Phase != "nginx_test_succeeded" {
+			return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_CURRENT", "release has already completed nginx activation")
 		}
 		return r.restore(target, st, rec, "RELEASE_ABORTED", errors.New("release aborted before nginx activation"))
 	case "test":
-		if rec.Result.Phase != "awaiting_nginx_test" {
-			return nginxCommandReject(req, http.StatusConflict, "NGINX_TEST_NOT_PENDING", "release is not awaiting nginx -t")
+		if rec.Result.Phase == "nginx_test_succeeded" && rec.NginxTested {
+			result := rec.Result
+			result.Replayed = true
+			result.HTTPStatus = http.StatusOK
+			return result
+		}
+		if rec.Result.Phase != "latest_switched" && rec.Result.Phase != "nginx_test" {
+			return nginxCommandReject(req, http.StatusConflict, "NGINX_TEST_NOT_AVAILABLE", "release has not completed its Git switch")
 		}
 		if e = r.stepWithOutput(deadline, st, rec, "nginx_test", r.nginxTest); e != nil {
 			return r.restore(target, st, rec, "NGINX_TEST_FAILED", e)
 		}
 		rec.NginxTested = true
-		return r.awaitNginxCommand(st, rec, "awaiting_nginx_reload", "nginx_test_passed")
+		rec.Result.Status = release.NodeStatusSucceeded
+		rec.Result.Phase = "nginx_test_succeeded"
+		rec.Result.ActivationStatus = "nginx_test_passed"
+		rec.Result.RollbackStatus = "not_needed"
+		rec.Result.FinishedAt = time.Now().UTC()
+		rec.HTTPStatus = http.StatusOK
+		if e = r.save(st); e != nil {
+			return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+		}
+		return r.result(rec)
 	case "reload":
-		if rec.Result.Phase != "awaiting_nginx_reload" || !rec.NginxTested {
-			return nginxCommandReject(req, http.StatusConflict, "NGINX_RELOAD_NOT_PENDING", "release requires a successful nginx -t before reload")
+		if rec.Result.Phase == "complete" && rec.Result.ActivationStatus == "reload_requested" {
+			result := rec.Result
+			result.Replayed = true
+			result.HTTPStatus = http.StatusOK
+			return result
+		}
+		if (rec.Result.Phase != "nginx_test_succeeded" && rec.Result.Phase != "reload" && rec.Result.Phase != "verify_activation") || !rec.NginxTested {
+			return nginxCommandReject(req, http.StatusConflict, "NGINX_RELOAD_NOT_AVAILABLE", "release requires a successful nginx -t")
 		}
 		if e = r.stepWithOutput(deadline, st, rec, "reload", r.nginxReload); e != nil {
 			return r.restore(target, st, rec, "NGINX_RELOAD_FAILED", e)

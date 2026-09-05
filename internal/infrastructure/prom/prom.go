@@ -29,7 +29,7 @@ func Step(env, typ, target, step, status string, t time.Duration) {
 	}
 }
 
-var ready = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "publish_ready", Help: "Node ready to accept publications (1 or 0)."}, []string{"env", "node_id"})
+var ready = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "publish_ready", Help: "HTTP service health, independent of release steps (1 or 0)."}, []string{"env", "node_id"})
 
 func Ready(env, node string, value bool) {
 	v := 0.0

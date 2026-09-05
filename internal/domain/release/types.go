@@ -52,8 +52,8 @@ type ApplyRequest struct {
 	BuildURL              string            `json:"build_url,omitempty"`
 }
 
-// NginxCommandRequest continues a release that has switched latest and is
-// waiting for Jenkins to run nginx -t or nginx -s reload explicitly.
+// NginxCommandRequest identifies the completed Git switch whose explicit
+// nginx -t or nginx -s reload action should run.
 type NginxCommandRequest struct {
 	ReleaseID string `json:"release_id"`
 	Env       string `json:"env"`

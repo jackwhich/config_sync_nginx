@@ -96,12 +96,13 @@ Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch`
 | `GET /healthz` | 协议能力、node_id、publish_ready、busy |
 | `GET /api/v1/releases/state` | 目标当前状态，或按 release_id 查询历史结果 |
 | `POST /api/v1/releases/apply` | 同步、校验、切换 latest；成功返回 HTTP 200 |
+| `POST /api/v1/releases/rollback` | 人工回滚当前 latest 到该服务保留的上一成功快照；随后仍需 nginx -t 与 reload |
 | `POST /api/v1/releases/nginx/test` | 对指定 release_id 执行 nginx -t；成功返回 HTTP 200 |
 | `POST /api/v1/releases/nginx/reload` | 对已通过检测的 release_id 执行 reload 与生效验证；成功后返回 HTTP 200 |
 | `POST /api/v1/releases/abort` | 可显式回滚尚未 reload 的 Git 切换 |
 | `GET /metrics` | 有限维度的 Prometheus 指标 |
 
-apply、nginx/test、nginx/reload、abort、state 使用 `X-Release-Token`。Nginx 命令和 abort 接口请求体只包含 `env` 和 `/apply` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
+apply、rollback、nginx/test、nginx/reload、abort、state 使用 `X-Release-Token`。Nginx 命令和 abort 接口请求体只包含 `env` 和 `/apply` 或 `/rollback` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
 
 简单发布请求如下，`commitid` 也可作为 `commit_id` 的兼容别名：
 
@@ -172,7 +173,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 默认失败策略为 `stop`，可在新批次开始前指定 `--failure-policy restore`。后者要求每台节点已有可恢复快照；首次部署使用 stop 并事先确定人工退出策略。未知结果未确认之前不启动任何恢复。恢复失败或基线变化会停止处理，保留记录供排查。
 
-保存批次文件到持久存储，文件内没有令牌。[Jenkinsfile](Jenkinsfile) 固定用于 config，显式检出其中配置的 GitLab 制品仓库，再以该仓库的 HEAD 发布；构建参数只暴露 ACTION 和 SERVER_NAME，`RELEASE_TYPE=config` 写在环境变量中。它用 curl 直连节点 HTTP，不调用批量脚本。白名单、前端发布和回滚使用独立 Jenkinsfile。GitLab 检出凭据与节点 Token 分别配置；详见 [Jenkins 发布说明](docs/jenkins.md)。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
+保存批次文件到持久存储，文件内没有令牌。[Jenkinsfile](Jenkinsfile) 固定用于 config：`ACTION=update` 显式检出其中配置的 GitLab 制品仓库并发布该仓库 HEAD；`ACTION=rollback` 不读取 Git，而是把每个节点当前 `latest` 回退到其保留的上一成功快照。两种动作均继续执行 nginx -t 和 reload；任一步失败都会恢复该次动作前的链接。构建参数只暴露 ACTION 和 SERVER_NAME，`RELEASE_TYPE=config` 写在环境变量中。它用 curl 直连节点 HTTP，不调用批量脚本。白名单、前端发布使用独立 Jenkinsfile。GitLab 检出凭据与节点 Token 分别配置；详见 [Jenkins 发布说明](docs/jenkins.md)。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
 
 ## 前端 ORAS 制品发布
 

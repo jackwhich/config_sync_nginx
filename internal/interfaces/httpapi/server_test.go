@@ -28,6 +28,9 @@ type resultPublisher struct {
 
 func (p resultPublisher) Apply(context.Context, release.ApplyRequest) release.Result { return p.result }
 func (p resultPublisher) Stage(context.Context, release.ApplyRequest) release.Result { return p.result }
+func (p resultPublisher) RollbackCurrent(context.Context, release.RollbackRequest) release.Result {
+	return p.result
+}
 func (p resultPublisher) NginxTest(context.Context, release.NginxCommandRequest) release.Result {
 	return p.result
 }
@@ -59,6 +62,19 @@ func TestNginxErrorsReachHTTPClient(t *testing.T) {
 		if rec.Code != code || got.Status != status || got.ErrorCode != errorCode || got.Error != diagnostic || len(got.Steps) != 1 || got.Steps[0].Message != diagnostic {
 			t.Fatal(rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestRollbackEndpointReturnsReleaseResult(t *testing.T) {
+	result := release.Result{ReleaseID: release.ID(), Status: release.NodeStatusSucceeded, Phase: "latest_switched", HTTPStatus: http.StatusOK}
+	cfg := config.Config{Env: "test", ReleaseAuthTokens: map[string]string{"test": "secret"}, MaxConcurrentRequests: 1, MaxRequestBytes: 2048}
+	h := New(resultPublisher{result: result}, cfg).Handler()
+	req := httptest.NewRequest("POST", "/api/v1/releases/rollback", strings.NewReader(`{"env":"test","type":"config","params":{"server_name":"site","path_dest":"/data/nginx-publish"}}`))
+	req.Header.Set("X-Release-Token", "secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rollback HTTP %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

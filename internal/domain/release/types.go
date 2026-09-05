@@ -58,6 +58,15 @@ type NginxCommandRequest struct {
 	ReleaseID string `json:"release_id"`
 	Env       string `json:"env"`
 }
+
+// RollbackRequest restores the current successful snapshot to the retained
+// snapshot immediately before it for one target.
+type RollbackRequest struct {
+	Env     string            `json:"env"`
+	Type    ReleaseType       `json:"type"`
+	Project string            `json:"project,omitempty"`
+	Params  map[string]string `json:"params"`
+}
 type Step struct {
 	Name       string     `json:"name"`
 	Status     NodeStatus `json:"status"`

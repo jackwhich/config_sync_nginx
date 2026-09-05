@@ -21,6 +21,7 @@ import (
 type Publisher interface {
 	Apply(context.Context, release.ApplyRequest) release.Result
 	Stage(context.Context, release.ApplyRequest) release.Result
+	RollbackCurrent(context.Context, release.RollbackRequest) release.Result
 	NginxTest(context.Context, release.NginxCommandRequest) release.Result
 	NginxReload(context.Context, release.NginxCommandRequest) release.Result
 	Abort(context.Context, release.NginxCommandRequest) release.Result
@@ -39,6 +40,7 @@ type Server struct {
 func New(r Publisher, cfg config.Config) *Server {
 	s := &Server{runner: r, cfg: cfg, mux: http.NewServeMux(), slots: make(chan struct{}, cfg.MaxConcurrentRequests)}
 	s.mux.HandleFunc("POST /api/v1/releases/apply", s.apply)
+	s.mux.HandleFunc("POST /api/v1/releases/rollback", s.rollback)
 	s.mux.HandleFunc("POST /api/v1/releases/nginx/test", s.nginxTest)
 	s.mux.HandleFunc("POST /api/v1/releases/nginx/reload", s.nginxReload)
 	s.mux.HandleFunc("POST /api/v1/releases/abort", s.abort)
@@ -58,6 +60,8 @@ func (s *Server) Handler() http.Handler {
 		switch r.URL.Path {
 		case "/api/v1/releases/apply":
 			handler = "apply"
+		case "/api/v1/releases/rollback":
+			handler = "rollback"
 		case "/api/v1/releases/nginx/test":
 			handler = "nginx_test"
 		case "/api/v1/releases/nginx/reload":
@@ -189,6 +193,49 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 	}
 	result := s.runner.Stage(r.Context(), req)
 	s.writeReleaseResult(w, result)
+}
+
+func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req release.RollbackRequest
+	err := dec.Decode(&req)
+	if err == nil {
+		var extra any
+		if next := dec.Decode(&extra); next != io.EOF {
+			if next == nil {
+				err = errors.New("only one JSON object is allowed")
+			} else {
+				err = next
+			}
+		}
+	}
+	if err != nil {
+		code := http.StatusBadRequest
+		var limit *http.MaxBytesError
+		if errors.As(err, &limit) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, code, "INVALID_JSON", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Env) == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "env is required")
+		return
+	}
+	if !s.cfg.AcceptsEnv(strings.TrimSpace(req.Env)) {
+		writeError(w, http.StatusForbidden, "ENV_NOT_ALLOWED", "environment not enabled")
+		return
+	}
+	if !s.authorize(w, r, strings.TrimSpace(req.Env)) {
+		return
+	}
+	s.writeReleaseResult(w, s.runner.RollbackCurrent(r.Context(), req))
 }
 
 func (s *Server) nginxTest(w http.ResponseWriter, r *http.Request) {

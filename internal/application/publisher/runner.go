@@ -411,6 +411,62 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	return r.apply(ctx, req, false)
 }
 
+// RollbackCurrent stages the retained snapshot immediately before the current
+// successful version. It never chooses a directory by name or mtime: both
+// snapshots must be the durable current/previous pair for this target.
+func (r *Runner) RollbackCurrent(ctx context.Context, req release.RollbackRequest) release.Result {
+	if e := release.ValidateRollbackRequest(&req); e != nil {
+		return rollbackReject(req, http.StatusBadRequest, "INVALID_REQUEST", e.Error())
+	}
+	if !r.cfg.AcceptsEnv(req.Env) {
+		return rollbackReject(req, http.StatusForbidden, "ENV_NOT_ALLOWED", "environment does not match this node")
+	}
+	t, e := r.Resolve(req.Type, req.Params["server_name"], req.Params["path_dest"], req.Project, req.Env)
+	if e != nil {
+		if errors.Is(e, lock.ErrBusy) {
+			return rollbackReject(req, http.StatusConflict, "NODE_BUSY", e.Error())
+		}
+		return rollbackReject(req, http.StatusForbidden, "TARGET_NOT_ALLOWED", e.Error())
+	}
+	st, e := r.store.Load(t.ID)
+	if e != nil {
+		return rollbackReject(req, http.StatusServiceUnavailable, "STATE_UNAVAILABLE", e.Error())
+	}
+	if st.Current == nil || st.Previous == nil {
+		return rollbackReject(req, http.StatusConflict, "ROLLBACK_NOT_AVAILABLE", "current version has no retained previous snapshot")
+	}
+	var releaseID string
+	var original *state.Record
+	for id, rec := range st.Records {
+		if rec == nil || rec.Result.Status != release.NodeStatusSucceeded || rec.Result.Phase != "complete" || rec.Result.ActivationStatus != "reload_requested" || rec.Candidate == nil || rec.Baseline == nil {
+			continue
+		}
+		if rec.Result.StateRevisionAfter == st.Revision && rec.Candidate.CommitID == st.Current.CommitID && rec.Baseline.CommitID == st.Previous.CommitID {
+			releaseID, original = id, rec
+			break
+		}
+	}
+	if original == nil {
+		return rollbackReject(req, http.StatusConflict, "ROLLBACK_NOT_AVAILABLE", "current version has no matching successful release record")
+	}
+	apply := original.Request
+	apply.ReleaseID = ""
+	apply.ExpectedStateRevision = st.Revision
+	apply.RestoreOf = releaseID
+	apply.Env = req.Env
+	apply.Type = t.Type
+	apply.Project = t.Project
+	apply.CommitID = st.Previous.CommitID
+	apply.Version = st.Previous.Version
+	apply.ArtifactDigest = st.Previous.ArtifactDigest
+	apply.Params = map[string]string{"server_name": t.ServerName, "path_dest": t.PathDest}
+	return r.Stage(ctx, apply)
+}
+
+func rollbackReject(req release.RollbackRequest, code int, key, msg string) release.Result {
+	return release.Result{ReleaseID: release.ID(), Env: req.Env, Type: req.Type, Project: req.Project, ServerName: release.ServerIdentity(req.Params), Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: msg, HTTPStatus: code, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
+}
+
 // Stage fetches and verifies a candidate, then switches latest. It is a
 // completed Git action: NginxTest and NginxReload are separate completed
 // actions which use this release's retained baseline if they need to roll back.

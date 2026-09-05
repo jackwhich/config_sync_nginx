@@ -32,6 +32,34 @@ func ValidateNginxCommandRequest(r *NginxCommandRequest) error {
 	return nil
 }
 
+func ValidateRollbackRequest(r *RollbackRequest) error {
+	if r.Params == nil {
+		r.Params = map[string]string{}
+	}
+	r.Env = strings.TrimSpace(r.Env)
+	r.Project = strings.TrimSpace(r.Project)
+	if r.Env == "" || len(r.Env) > 64 || len(r.Project) > 128 {
+		return fieldError("env/project", "不能为空或超长")
+	}
+	if r.Type != ReleaseTypeConfig && r.Type != ReleaseTypeWhitelist && r.Type != ReleaseTypeFrontendStatic {
+		return fieldError("type", "不支持的发布类型")
+	}
+	if err := ValidateRepoSiteDirectoryName(ServerIdentity(r.Params)); err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(r.Params["path_dest"])
+	if !filepath.IsAbs(raw) || len(raw) > 4096 || strings.IndexByte(raw, 0) >= 0 {
+		return fieldError("params.path_dest", "须为有效绝对路径")
+	}
+	for k := range r.Params {
+		if k != "path_dest" && k != "server_name" {
+			return fieldError("params", "不支持字段 "+k)
+		}
+	}
+	r.Params = map[string]string{"path_dest": filepath.Clean(raw), "server_name": ServerIdentity(r.Params)}
+	return nil
+}
+
 func ValidateApplyRequest(r *ApplyRequest) error {
 	if r.Params == nil {
 		r.Params = map[string]string{}

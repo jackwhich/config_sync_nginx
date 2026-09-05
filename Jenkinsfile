@@ -54,7 +54,7 @@ pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds(); skipDefaultCheckout() }
   parameters {
-    choice(name: 'ACTION', choices: ['update'], description: '配置发布操作')
+    choice(name: 'ACTION', choices: ['update', 'rollback'], description: 'update 发布当前 Git 提交；rollback 回退到当前版本的上一快照')
     choice(name: 'SERVER_NAME', choices: ['ybf-uat-nginx', 'jp-ybf-uat-nginx'], description: '配置中允许的站点')
   }
   environment {
@@ -73,6 +73,7 @@ pipeline {
   }
   stages {
     stage('Checkout release source') {
+      when { expression { params.ACTION == 'update' } }
       steps {
         checkout([$class: 'GitSCM',
           branches: [[name: "*/${env.RELEASE_BRANCH}"]],
@@ -89,25 +90,29 @@ pipeline {
       steps {
         script {
           if (!isUnix()) { error('发布执行器需要 curl，请使用 Linux 执行器') }
+          if (!(params.ACTION in ['update', 'rollback'])) { error('ACTION 只能为 update 或 rollback') }
+          env.RELEASE_ACTION = params.ACTION
           env.RELEASE_SERVER_NAME = params.SERVER_NAME
           env.RELEASE_URLS = env["SERVICE_URLS_${params.SERVER_NAME.replace('-', '_')}"]
-          env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()
           if (env.RELEASE_TYPE != 'config') { error('本 Job 仅支持 RELEASE_TYPE=config') }
-          if (!(env.RELEASE_COMMIT ==~ /(?:[a-f0-9]{40}|[a-f0-9]{64})/)) {
-            error('GitLab 制品仓库当前提交必须是完整 SHA')
-          }
           if (!env.RELEASE_URLS?.trim()) { error('未配置该站点的节点 HTTP 地址') }
-          writeFile file: 'release-request.json', text: groovy.json.JsonOutput.toJson([
-            env: env.RELEASE_ENV,
-            type: env.RELEASE_TYPE,
-            branch: env.RELEASE_BRANCH,
-            commit_id: env.RELEASE_COMMIT,
-            project: env.RELEASE_PROJECT,
-            params: [
-              server_name: env.RELEASE_SERVER_NAME,
-              path_dest: env.RELEASE_PATH_DEST
-            ]
-          ])
+          if (env.RELEASE_ACTION == 'update') {
+            env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()
+            if (!(env.RELEASE_COMMIT ==~ /(?:[a-f0-9]{40}|[a-f0-9]{64})/)) {
+              error('GitLab 制品仓库当前提交必须是完整 SHA')
+            }
+            writeFile file: 'release-request.json', text: groovy.json.JsonOutput.toJson([
+              env: env.RELEASE_ENV,
+              type: env.RELEASE_TYPE,
+              branch: env.RELEASE_BRANCH,
+              commit_id: env.RELEASE_COMMIT,
+              project: env.RELEASE_PROJECT,
+              params: [
+                server_name: env.RELEASE_SERVER_NAME,
+                path_dest: env.RELEASE_PATH_DEST
+              ]
+            ])
+          }
         }
       }
     }
@@ -130,11 +135,19 @@ pipeline {
                 node_id="\$(sed -nE 's/.*"node_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\\1/p' "sync-health-${index}.json" | head -n 1)"
                 test -n "\$node_id" || { echo '健康检查缺少 node_id'; exit 1; }
                 printf '%s\n' "\$node_id" > "release-node-${index}.txt"
+                endpoint="\$node/api/v1/releases/apply"
+                request_file='release-request.json'
+                if [ "\$RELEASE_ACTION" = rollback ]; then
+                  endpoint="\$node/api/v1/releases/rollback"
+                  request_file="rollback-request-${index}.json"
+                  printf '{"env":"%s","type":"%s","project":"%s","params":{"server_name":"%s","path_dest":"%s"}}' \
+                    "\$RELEASE_ENV" "\$RELEASE_TYPE" "\$RELEASE_PROJECT" "\$RELEASE_SERVER_NAME" "\$RELEASE_PATH_DEST" > "\$request_file"
+                fi
                 code="\$(curl -sS -o "sync-response-${index}.json" -w '%{http_code}' --max-time 420 \\
-                  -X POST "\$node/api/v1/releases/apply" \\
+                  -X POST "\$endpoint" \\
                   -H 'Content-Type: application/json' \\
                   -H "X-Release-Token: \$RELEASE_TOKEN" \\
-                  --data-binary @release-request.json)"
+                  --data-binary @"\$request_file")"
                 printf '%s\n' "\$code" > "sync-http-${index}.txt"
                 if [ "\$code" = 200 ] && grep -Eq '"status"[[:space:]]*:[[:space:]]*"skipped"' "sync-response-${index}.json"; then
                   printf '%s\n' skipped > "release-status-${index}.txt"
@@ -159,14 +172,20 @@ pipeline {
                 """)
               } finally {
                 if (fileExists("sync-response-${index}.json")) {
-                  showReleaseLog('同步 Git 并切换 latest', "${env.RELEASE_TYPE}:${env.RELEASE_SERVER_NAME}",
+                  def actionTitle = env.RELEASE_ACTION == 'rollback' ? '回滚至上一版本并切换 latest' : '同步 Git 并切换 latest'
+                  def actionTasks = env.RELEASE_ACTION == 'rollback' ? [
+                    [title: '读取当前版本与上一快照', name: 'verify_baseline'],
+                    [title: '校验回滚快照', name: 'prepare_snapshot'],
+                    [title: '切换 latest', name: 'switch']
+                  ] : [
+                    [title: "同步 Git（branch=${env.RELEASE_BRANCH}）", name: 'fetch'],
+                    [title: '准备配置快照', name: 'prepare_snapshot'],
+                    [title: '切换 latest', name: 'switch']
+                  ]
+                  showReleaseLog(actionTitle, "${env.RELEASE_TYPE}:${env.RELEASE_SERVER_NAME}",
                     fileExists("release-node-${index}.txt") ? readFile("release-node-${index}.txt").trim() : env.RELEASE_NODE_URL,
                     fileExists("sync-http-${index}.txt") ? readFile("sync-http-${index}.txt").trim() : '-',
-                    readFile("sync-response-${index}.json"), [
-                      [title: "同步 Git（branch=${env.RELEASE_BRANCH}）", name: 'fetch'],
-                      [title: '准备配置快照', name: 'prepare_snapshot'],
-                      [title: '切换 latest', name: 'switch']
-                    ])
+                    readFile("sync-response-${index}.json"), actionTasks)
                 }
               }
             }

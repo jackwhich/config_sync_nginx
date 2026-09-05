@@ -92,6 +92,18 @@ nginx -s reload
 
 `POST /api/v1/releases/apply` 只负责同步来源、校验候选快照并原子切换 `latest`。这是一个已完成的 Git 操作，成功后返回 HTTP 200、`status: succeeded`、阶段 `latest_switched`。它不把节点置为等待或暂停状态。
 
+人工回滚使用独立接口，不读取 Git，也不按目录修改时间推断上一版本：
+
+```http
+POST /api/v1/releases/rollback
+Content-Type: application/json
+X-Release-Token: <uat 对应的 Token>
+
+{"env":"uat","type":"config","project":"ybf","params":{"server_name":"ybf-uat-nginx","path_dest":"/data/nginx-publish"}}
+```
+
+服务从该目标的持久状态读取 `current` 和 `previous`，仅当它们是一次完整成功发布保存的相邻快照时才切换 `latest`。因此“当前 hash 的上一个版本”始终是这台机器实际保留的上一成功版本，而不是 `ls` 中时间看起来较新的目录。接口成功后返回新的 `release_id` 和 `latest_switched`；发布方必须继续对这个 ID 调用 nginx/test 与 nginx/reload。检测或 reload 失败时，服务自动恢复本次回滚前的 current。
+
 发布方必须使用同一个 `release_id` 再依次调用以下接口。二者均使用和 apply 相同的 `X-Release-Token`：
 
 ```http

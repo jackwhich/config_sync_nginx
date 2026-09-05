@@ -211,6 +211,51 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 	}
 }
 
+func TestManualRollbackUsesRetainedPreviousSnapshot(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	f.apply(b)
+
+	rolledBack := f.r.RollbackCurrent(context.Background(), release.RollbackRequest{
+		Env: "test", Type: release.ReleaseTypeConfig,
+		Params: map[string]string{"server_name": "site", "path_dest": f.cfg.Targets[0].PathDest},
+	})
+	if rolledBack.Status != release.NodeStatusSucceeded || rolledBack.Phase != "latest_switched" || rolledBack.CommitID != a || rolledBack.PreviousCommitID != b {
+		t.Fatalf("rollback stage: %+v", rolledBack)
+	}
+	command := release.NginxCommandRequest{Env: "test", ReleaseID: rolledBack.ReleaseID}
+	if tested := f.r.NginxTest(context.Background(), command); tested.Status != release.NodeStatusSucceeded {
+		t.Fatalf("rollback nginx test: %+v", tested)
+	}
+	if activated := f.r.NginxReload(context.Background(), command); activated.Status != release.NodeStatusSucceeded || activated.Phase != "complete" {
+		t.Fatalf("rollback reload: %+v", activated)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || st.Previous.CommitID != b || link != a {
+		t.Fatalf("rollback target mismatch: %+v latest=%s", st, link)
+	}
+	rolledForward := f.r.RollbackCurrent(context.Background(), release.RollbackRequest{
+		Env: "test", Type: release.ReleaseTypeConfig,
+		Params: map[string]string{"server_name": "site", "path_dest": f.cfg.Targets[0].PathDest},
+	})
+	if rolledForward.Status != release.NodeStatusSucceeded || rolledForward.CommitID != b {
+		t.Fatalf("second rollback stage: %+v", rolledForward)
+	}
+	command.ReleaseID = rolledForward.ReleaseID
+	if tested := f.r.NginxTest(context.Background(), command); tested.Status != release.NodeStatusSucceeded {
+		t.Fatalf("second rollback nginx test: %+v", tested)
+	}
+	if activated := f.r.NginxReload(context.Background(), command); activated.Status != release.NodeStatusSucceeded || activated.Phase != "complete" {
+		t.Fatalf("second rollback reload: %+v", activated)
+	}
+	st, link = f.current()
+	if st.Current.CommitID != b || st.Previous.CommitID != a || link != b {
+		t.Fatalf("second rollback target mismatch: %+v latest=%s", st, link)
+	}
+}
+
 func TestLegacyBaselineLinkMigratesToDirectSnapshot(t *testing.T) {
 	f := newFixture(t)
 	commit := f.commit("A")

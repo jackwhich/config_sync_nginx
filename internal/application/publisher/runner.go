@@ -11,6 +11,7 @@ import (
 	"nginx_updata_config/internal/infrastructure/oras"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -497,19 +498,13 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	defer base.Close()
 	// Validate the real baseline even for a same-commit skip.
 	e = r.step(prep, st, rec, "verify_baseline", func(c context.Context) error {
-		link, e := fsutil.Link(base)
+		link, e := r.verifyBaseline(c, t, base, st)
 		if e != nil {
 			return e
 		}
-		expected := ""
-		if st.Current != nil {
-			expected = st.Current.Link
-		}
-		if link != expected {
-			return fmt.Errorf("live latest differs from authoritative baseline")
-		}
 		rec.BeforeLink = link
-		return r.verify(c, t, base, st.Current)
+		rec.Baseline = st.Current
+		return nil
 	})
 	if e != nil {
 		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
@@ -880,24 +875,78 @@ type errorMarker struct{}
 
 func (errorMarker) Error() string { return "service stopped before activation" }
 
+// verifyBaseline normalizes an absolute latest link and migrates an already
+// verified snapshot from the former releases/<commit> state representation to
+// the direct <commit> layout. It never accepts a different commit or an
+// unverified directory as a baseline.
+func (r *Runner) verifyBaseline(ctx context.Context, t config.Target, base *os.Root, st *state.TargetState) (string, error) {
+	raw, err := fsutil.Link(base)
+	if err != nil {
+		return "", err
+	}
+	live, err := normalizeSnapshotLink(t, raw)
+	if err != nil {
+		return "", fmt.Errorf("live latest differs from authoritative baseline")
+	}
+	expected := ""
+	if st.Current != nil {
+		expected, err = normalizeSnapshotLink(t, st.Current.Link)
+		if err != nil {
+			return "", fmt.Errorf("stored baseline has an invalid snapshot link")
+		}
+	}
+	if live != expected {
+		if st.Current == nil || snapshotCommit(live) == "" || snapshotCommit(live) != snapshotCommit(expected) {
+			return "", fmt.Errorf("live latest differs from authoritative baseline")
+		}
+		migrated := *st.Current
+		migrated.Link = live
+		if _, err = verifySnapshot(ctx, base, &migrated); err != nil {
+			return "", err
+		}
+		st.Current = &migrated
+	}
+	if err = r.verify(ctx, t, base, st.Current); err != nil {
+		return "", err
+	}
+	return live, nil
+}
+
+func normalizeSnapshotLink(t config.Target, link string) (string, error) {
+	if link == "" {
+		return "", nil
+	}
+	if filepath.IsAbs(link) {
+		var err error
+		link, err = filepath.Rel(t.Dir, link)
+		if err != nil {
+			return "", err
+		}
+	}
+	link = filepath.ToSlash(filepath.Clean(link))
+	if release.IsCommit(link) {
+		return link, nil
+	}
+	if strings.HasPrefix(link, "releases/") && release.IsCommit(strings.TrimPrefix(link, "releases/")) {
+		return link, nil
+	}
+	return "", fmt.Errorf("unsafe snapshot link")
+}
+
+func snapshotCommit(link string) string {
+	if release.IsCommit(link) {
+		return link
+	}
+	return strings.TrimPrefix(link, "releases/")
+}
+
 func (r *Runner) checkStoredBaseline(ctx context.Context, t config.Target, st *state.TargetState) error {
 	base, err := openTarget(t)
 	if err != nil {
 		return err
 	}
 	defer base.Close()
-	expected := ""
-	if st.Current != nil {
-		expected = st.Current.Link
-	}
-	link, err := fsutil.Link(base)
-	if err != nil {
-		return err
-	}
-	if link != expected {
-		return fmt.Errorf("latest differs from persistent baseline")
-	}
-	if err := r.verify(ctx, t, base, st.Current); err != nil {
+	if _, err = r.verifyBaseline(ctx, t, base, st); err != nil {
 		return err
 	}
 	return r.verifyRetainedAssets(ctx, t, base, st, nil)

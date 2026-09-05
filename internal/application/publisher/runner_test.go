@@ -196,6 +196,33 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 		t.Fatalf("idempotency lost on restart: %+v", got)
 	}
 }
+
+func TestLegacyBaselineLinkMigratesToDirectSnapshot(t *testing.T) {
+	f := newFixture(t)
+	commit := f.commit("A")
+	f.apply(commit)
+	target := f.cfg.Targets[0]
+	if err := os.Remove(filepath.Join(target.Dir, "latest")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(target.Dir, commit), filepath.Join(target.Dir, "latest")); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := f.current()
+	st.Current.Link = "releases/" + commit
+	if err := f.r.store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	result := f.r.Apply(context.Background(), f.request(commit))
+	if result.Status != release.NodeStatusSkipped {
+		t.Fatalf("legacy snapshot was not migrated: %+v", result)
+	}
+	st, link := f.current()
+	if st.Current.Link != commit || link != filepath.Join(target.Dir, commit) {
+		t.Fatalf("unexpected migrated baseline: %+v, %q", st.Current, link)
+	}
+}
 func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")

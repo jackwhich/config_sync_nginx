@@ -166,6 +166,12 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, "releases")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("config release unexpectedly created releases directory: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site", "site.conf")); err != nil {
+		t.Fatalf("Git server directory was not preserved in snapshot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site.conf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Git server directory was unexpectedly flattened: %v", err)
+	}
 	replay := f.r.Apply(context.Background(), req)
 	if !replay.Replayed || replay.StateRevisionAfter != res.StateRevisionAfter {
 		t.Fatalf("replay: %+v", replay)
@@ -390,7 +396,7 @@ func TestDriftAndCorruptSnapshotDoNotSkip(t *testing.T) {
 			f.apply(a)
 			target := f.cfg.Targets[0]
 			if kind == "content" {
-				if e := os.WriteFile(filepath.Join(target.Dir, a, "site.conf"), []byte("changed"), 0644); e != nil {
+				if e := os.WriteFile(filepath.Join(target.Dir, a, "site", "site.conf"), []byte("changed"), 0644); e != nil {
 					t.Fatal(e)
 				}
 			} else {

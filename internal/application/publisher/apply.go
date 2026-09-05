@@ -194,11 +194,19 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, e
 	}
 	defer src.Close()
-	site, e := src.OpenRoot(t.ServerName)
-	if e != nil {
-		return nil, e
+	// Git export contains only the requested server_name directory. Preserve
+	// that directory inside config/whitelist snapshots: the deployment root is
+	// already named after server_name, so the Git data intentionally forms the
+	// second server_name layer below the version hash. Frontend artifacts keep
+	// their existing flat layout for Nginx root compatibility.
+	sourceRoot := src
+	if t.Type == release.ReleaseTypeFrontendStatic {
+		sourceRoot, e = src.OpenRoot(t.ServerName)
+		if e != nil {
+			return nil, e
+		}
+		defer sourceRoot.Close()
 	}
-	defer site.Close()
 	stage := ".staging/stage-" + release.ID()
 	if e = base.Mkdir(stage, 0755); e != nil {
 		return nil, e
@@ -216,7 +224,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	m := &state.Manifest{CommitID: commit, Source: source, CreatedAt: time.Now().UTC(), Files: map[string]state.File{}}
 	var bytes uint64
 	count := 0
-	e = fs.WalkDir(site.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+	e = fs.WalkDir(sourceRoot.FS(), ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -238,7 +246,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if t.Type == release.ReleaseTypeFrontendStatic && t.SharedAssets && name == "frontend-manifest.json" {
 			return nil
 		}
-		f, err := hashFile(ctx, site, name)
+		f, err := hashFile(ctx, sourceRoot, name)
 		if err != nil {
 			return err
 		}
@@ -250,7 +258,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if err = ensureSpace(base, c.MinFreeBytes+uint64(f.Size)); err != nil {
 			return err
 		}
-		if err = fsutil.CopyFile(ctx, site, dst, name, name, t.Mode()); err != nil {
+		if err = fsutil.CopyFile(ctx, sourceRoot, dst, name, name, t.Mode()); err != nil {
 			return err
 		}
 		m.Files[name] = f
@@ -263,12 +271,12 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, fmt.Errorf("empty site")
 	}
 	for _, name := range t.RequiredFiles {
-		if _, ok := m.Files[name]; !ok {
+		if _, ok := m.Files[requiredSnapshotPath(t, name)]; !ok {
 			return nil, fmt.Errorf("required file missing: %s", name)
 		}
 	}
 	if t.Type == release.ReleaseTypeFrontendStatic {
-		if e = validateFrontend(ctx, site, m, t.SharedAssets); e != nil {
+		if e = validateFrontend(ctx, sourceRoot, m, t.SharedAssets); e != nil {
 			return nil, e
 		}
 	}
@@ -302,6 +310,13 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	}
 	v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: t.SnapshotLink(commit), ManifestDigest: manifestDigest(m)}
 	return v, nil
+}
+
+func requiredSnapshotPath(t config.Target, name string) string {
+	if t.Type == release.ReleaseTypeFrontendStatic {
+		return name
+	}
+	return path.Join(t.ServerName, name)
 }
 
 // existingSnapshotLink accepts the former releases/<commit> layout only to

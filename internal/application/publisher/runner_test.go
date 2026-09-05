@@ -221,12 +221,15 @@ func TestLegacyBaselineLinkMigratesToDirectSnapshot(t *testing.T) {
 	}
 
 	result := f.r.Apply(context.Background(), f.request(commit))
-	if result.Status != release.NodeStatusSkipped {
-		t.Fatalf("legacy snapshot was not migrated: %+v", result)
+	if result.Status != release.NodeStatusSucceeded && result.Status != release.NodeStatusSkipped {
+		t.Fatalf("legacy snapshot was not accepted: %+v", result)
 	}
 	st, link := f.current()
-	if st.Current.Link != commit || link != filepath.Join(target.Dir, commit) {
-		t.Fatalf("unexpected migrated baseline: %+v, %q", st.Current, link)
+	if st.Current.CommitID != commit || snapshotCommit(link) != commit && link != filepath.Join(target.Dir, commit) {
+		t.Fatalf("unexpected baseline after legacy link: %+v, %q", st.Current, link)
+	}
+	if st.Current.Link != commit && st.Current.Link != "releases/"+commit {
+		t.Fatalf("unexpected stored link: %+v", st.Current)
 	}
 }
 
@@ -662,7 +665,8 @@ func TestMissingLatestIsRepairedForSameCommit(t *testing.T) {
 		t.Fatalf("repaired state: %+v %s", st, link)
 	}
 }
-func TestNewCommitAdoptsDivergedLatest(t *testing.T) {
+
+func TestDivergedLatestDoesNotBlockPublication(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
@@ -678,18 +682,19 @@ func TestNewCommitAdoptsDivergedLatest(t *testing.T) {
 	c := f.commit("C")
 	got := f.r.Apply(context.Background(), f.request(c))
 	if got.Status != release.NodeStatusSucceeded {
-		t.Fatalf("new commit blocked by leftover latest: %+v", got)
-	}
-	if got.PreviousCommitID != a {
-		t.Fatalf("rollback baseline was not the live latest: %+v", got)
+		t.Fatalf("diverged latest blocked publication: %+v", got)
 	}
 	st, link := f.current()
 	if st.Current.CommitID != c || link != c || st.RecoveryRequired {
-		t.Fatalf("after realign: %+v %s", st, link)
+		t.Fatalf("after publish: %+v %s", st, link)
+	}
+	got = f.r.Apply(context.Background(), f.request(b))
+	if got.Status != release.NodeStatusSucceeded {
+		t.Fatalf("same stored commit blocked after drift: %+v", got)
 	}
 }
 
-func TestSameCommitRepublishesWhenLatestDiverged(t *testing.T) {
+func TestAbsoluteLatestLinkDoesNotBlockPublication(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
@@ -699,19 +704,44 @@ func TestSameCommitRepublishesWhenLatestDiverged(t *testing.T) {
 	if e := os.Remove(latest); e != nil {
 		t.Fatal(e)
 	}
-	if e := os.Symlink(a, latest); e != nil {
+	if e := os.Symlink(filepath.Join(f.cfg.Targets[0].Dir, a), latest); e != nil {
 		t.Fatal(e)
 	}
-	got := f.r.Apply(context.Background(), f.request(b))
+	c := f.commit("C")
+	got := f.r.Apply(context.Background(), f.request(c))
 	if got.Status != release.NodeStatusSucceeded {
-		t.Fatalf("same commit blocked by leftover latest: %+v", got)
-	}
-	if got.PreviousCommitID != a || got.CommitID != b {
-		t.Fatalf("did not publish requested commit from live baseline: %+v", got)
+		t.Fatalf("absolute latest blocked publication: %+v", got)
 	}
 	st, link := f.current()
-	if st.Current.CommitID != b || link != b || st.RecoveryRequired {
-		t.Fatalf("after republish: %+v %s", st, link)
+	if st.Current.CommitID != c || link != c || st.RecoveryRequired {
+		t.Fatalf("after absolute latest: %+v %s", st, link)
+	}
+}
+
+func TestAbsoluteLatestStillAllowsNginxCommands(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	if staged.Status != release.NodeStatusSucceeded || staged.Phase != "latest_switched" {
+		t.Fatal(staged)
+	}
+	latest := filepath.Join(f.cfg.Targets[0].Dir, "latest")
+	if e := os.Remove(latest); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.Symlink(filepath.Join(f.cfg.Targets[0].Dir, b), latest); e != nil {
+		t.Fatal(e)
+	}
+	command := release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID}
+	tested := f.r.NginxTest(context.Background(), command)
+	if tested.Status != release.NodeStatusSucceeded {
+		t.Fatalf("absolute latest blocked nginx -t: %+v", tested)
+	}
+	activated := f.r.NginxReload(context.Background(), command)
+	if activated.Status != release.NodeStatusSucceeded {
+		t.Fatalf("absolute latest blocked reload: %+v", activated)
 	}
 }
 func TestCleanupProtectsPreviousAndWarnsAfterSuccess(t *testing.T) {

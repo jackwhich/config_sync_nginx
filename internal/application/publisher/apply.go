@@ -516,15 +516,12 @@ func cleanupSnapshots(ctx context.Context, c config.Config, t config.Target, st 
 	}
 	keep(st.Current)
 	keep(st.Previous)
-	link, e := fsutil.Link(base)
-	if e != nil {
+	if raw, e := fsutil.Link(base); e != nil {
 		return e
-	}
-	if release.IsCommit(link) {
-		protect[link] = true
-	}
-	if strings.HasPrefix(link, "releases/") {
-		protect[strings.TrimPrefix(link, "releases/")] = true
+	} else if live, e := normalizeSnapshotLink(t, raw); e == nil {
+		if commit := snapshotCommit(live); release.IsCommit(commit) {
+			protect[commit] = true
+		}
 	}
 	for _, r := range st.Records {
 		if !r.Result.Terminal() || (t.Type == release.ReleaseTypeFrontendStatic && r.Intent && time.Since(r.Result.FinishedAt) < c.AssetRetention.Value()) {

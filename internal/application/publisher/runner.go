@@ -365,25 +365,15 @@ func reject(req release.ApplyRequest, code int, key, msg string) release.Result 
 	return release.Result{ReleaseID: req.ReleaseID, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: msg, HTTPStatus: code, StartedAt: time.Now().UTC()}
 }
 
-func leftoverCommit(rec *state.Record) string {
-	if rec.Request.CommitID != "" {
-		return rec.Request.CommitID
-	}
-	return rec.Result.CommitID
-}
-
-// takeover lets a later commit own the target. RecoveryRequired is a stored
-// outcome of leftover work, not a node lock. A new commit_id proceeds; the
-// previous release_id is only closed out when the commit itself changed.
+// takeover clears leftover recovery marks so a new request can publish by commit_id.
 func (r *Runner) takeover(st *state.TargetState, req release.ApplyRequest) {
 	if id := st.ActiveID; id != "" && id != req.ReleaseID {
-		if rec := st.Records[id]; rec != nil && !rec.Result.Terminal() && leftoverCommit(rec) != req.CommitID {
+		if rec := st.Records[id]; rec != nil && !rec.Result.Terminal() {
 			rec.Result.Status = release.NodeStatusFailed
 			rec.Result.ErrorCode = "SUPERSEDED"
-			rec.Result.Error = "superseded by a newer commit"
+			rec.Result.Error = "superseded by a newer publication"
 			rec.Result.FinishedAt = time.Now().UTC()
 			rec.HTTPStatus = http.StatusConflict
-			applog.LogWarn("新提交接管未完成的旧任务", "release_superseded", map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "target_id": st.Target.ID, "release_id": id, "commit_id": leftoverCommit(rec), "incoming_commit_id": req.CommitID})
 		}
 	}
 	st.ActiveID = ""
@@ -529,28 +519,14 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		return r.fail(st, rec, "TARGET_UNAVAILABLE", e)
 	}
 	defer base.Close()
-	// Observe live latest for rollback. Never block a publication on stored
-	// baseline drift: identity is the requested commit_id.
-	var liveOK bool
-	var liveCommit, liveSource string
+	// Record rollback target from stored Current only. Live latest is never a gate.
 	e = r.step(prep, st, rec, "verify_baseline", func(c context.Context) error {
 		if err := c.Err(); err != nil {
 			return err
 		}
-		link, live := r.observeLiveCommit(c, t, base)
-		rec.BeforeLink = link
-		if live != nil {
-			liveOK = true
-			liveCommit = live.CommitID
-			liveSource = live.Source
-			if st.Current != nil && st.Current.CommitID != live.CommitID {
-				st.Previous = st.Current
-			}
-			st.Current = live
-			rec.Baseline = live
-			rec.Result.PreviousCommitID = live.CommitID
-		} else if st.Current != nil {
+		if st.Current != nil {
 			rec.Baseline = st.Current
+			rec.BeforeLink = st.Current.Link
 			rec.Result.PreviousCommitID = st.Current.CommitID
 		}
 		return nil
@@ -561,24 +537,34 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		}
 		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
 	}
-	if liveOK && liveCommit == req.CommitID && liveSource == source {
-		for _, existing := range st.Records {
-			if existing.Candidate != nil && existing.Candidate.CommitID == req.CommitID && existing.Candidate.Source == source && existing.Result.Status == release.NodeStatusSucceeded && resumableNginxPhase(existing.Result.Phase) {
-				result := existing.Result
-				result.Replayed = true
-				result.HTTPStatus = http.StatusOK
-				return result
+	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == source {
+		liveCommit := ""
+		if raw, err := fsutil.Link(base); err == nil {
+			if live, err := normalizeSnapshotLink(t, raw); err == nil {
+				liveCommit = snapshotCommit(live)
 			}
 		}
-		rec.Result.Status = release.NodeStatusSkipped
-		rec.Result.Phase = "complete"
-		rec.Result.FinishedAt = time.Now().UTC()
-		rec.HTTPStatus = 200
-		st.ActiveID = ""
-		if e = r.save(st); e != nil {
-			return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+		if liveCommit == req.CommitID {
+			if _, err := verifySnapshot(prep, base, st.Current); err == nil {
+				for _, existing := range st.Records {
+					if existing.Candidate != nil && existing.Candidate.CommitID == req.CommitID && existing.Candidate.Source == source && existing.Result.Status == release.NodeStatusSucceeded && resumableNginxPhase(existing.Result.Phase) {
+						result := existing.Result
+						result.Replayed = true
+						result.HTTPStatus = http.StatusOK
+						return result
+					}
+				}
+				rec.Result.Status = release.NodeStatusSkipped
+				rec.Result.Phase = "complete"
+				rec.Result.FinishedAt = time.Now().UTC()
+				rec.HTTPStatus = 200
+				st.ActiveID = ""
+				if e = r.save(st); e != nil {
+					return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+				}
+				return r.result(rec)
+			}
 		}
-		return r.result(rec)
 	}
 	if req.RestoreOf != "" {
 		original := st.Records[req.RestoreOf]
@@ -652,9 +638,6 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 	// Critical work has its own deadline: disconnects can no longer interrupt activation/recovery.
 	critical, criticalCancel := context.WithDeadline(context.Background(), deadline)
 	defer criticalCancel()
-	if currentLink, err := fsutil.Link(base); err != nil || currentLink != rec.BeforeLink {
-		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", fmt.Errorf("latest changed during preparation"))
-	}
 	rec.Intent = true
 	rec.Result.Phase = "switch_intent"
 	if e = r.save(st); e != nil {
@@ -907,11 +890,10 @@ func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRe
 	if st.Current == nil || st.Current.CommitID != rec.Candidate.CommitID || st.Current.Source != rec.Candidate.Source {
 		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_CURRENT", "a newer Git switch is now current")
 	}
-	if link, e := fsutil.Link(base); e != nil || link != rec.Candidate.Link {
-		if e == nil {
-			e = fmt.Errorf("latest changed before nginx command")
-		}
-		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
+	if raw, e := fsutil.Link(base); e != nil {
+		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_CURRENT", "latest is unavailable for this release")
+	} else if live, e := normalizeSnapshotLink(target, raw); e != nil || snapshotCommit(live) != rec.Candidate.CommitID {
+		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_CURRENT", "a newer Git switch is now current")
 	}
 	deadline, cancel := context.WithTimeout(ctx, r.cfg.ExecutionTimeout.Value())
 	defer cancel()
@@ -1116,7 +1098,7 @@ func (r *Runner) restoreLocal(ctx context.Context, t config.Target, base *os.Roo
 	if e := ctx.Err(); e != nil {
 		return e
 	}
-	if e := fsutil.Switch(base, rec.BeforeLink); e != nil {
+	if e := fsutil.Switch(base, rollbackLink(t, rec)); e != nil {
 		return e
 	}
 	if _, e := r.nginxTest(ctx); e != nil {
@@ -1155,12 +1137,16 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 		return
 	}
 	defer base.Close()
-	link, e := fsutil.Link(base)
+	raw, e := fsutil.Link(base)
 	if e != nil {
 		r.uncertain(st, rec, "RECOVERY_FAILED", e)
 		return
 	}
-	if rec.Candidate != nil && link == rec.Candidate.Link {
+	liveCommit := ""
+	if live, err := normalizeSnapshotLink(t, raw); err == nil {
+		liveCommit = snapshotCommit(live)
+	}
+	if rec.Candidate != nil && liveCommit == rec.Candidate.CommitID {
 		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil {
 			_, e = r.nginxTest(ctx)
 		}
@@ -1177,9 +1163,6 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 			r.commit(t, st, rec)
 			return
 		}
-	} else if link != rec.BeforeLink && (rec.LegacyLink == "" || link != rec.LegacyLink) {
-		r.uncertain(st, rec, "EXTERNAL_DRIFT", fmt.Errorf("latest no longer matches candidate or baseline"))
-		return
 	}
 	cause := fmt.Errorf("interrupted activation; restoring local baseline")
 	if e != nil {
@@ -1192,38 +1175,17 @@ type errorMarker struct{}
 
 func (errorMarker) Error() string { return "service stopped before activation" }
 
-// observeLiveCommit reads latest. A verified snapshot is returned for skip and
-// rollback; a diverged or missing link never fails the publication.
-func (r *Runner) observeLiveCommit(ctx context.Context, t config.Target, base *os.Root) (string, *state.Version) {
-	raw, err := fsutil.Link(base)
-	if err != nil || raw == "" {
-		return "", nil
+func rollbackLink(t config.Target, rec *state.Record) string {
+	if rec.Baseline != nil && rec.Baseline.Link != "" {
+		if link, err := normalizeSnapshotLink(t, rec.Baseline.Link); err == nil {
+			return link
+		}
+		return rec.Baseline.Link
 	}
-	live, err := normalizeSnapshotLink(t, raw)
-	if err != nil {
-		return "", nil
+	if link, err := normalizeSnapshotLink(t, rec.BeforeLink); err == nil {
+		return link
 	}
-	adopted, err := versionFromLiveSnapshot(ctx, base, live)
-	if err != nil {
-		return live, nil
-	}
-	return live, adopted
-}
-
-func versionFromLiveSnapshot(ctx context.Context, base *os.Root, link string) (*state.Version, error) {
-	commit := snapshotCommit(link)
-	if !release.IsCommit(commit) {
-		return nil, fmt.Errorf("latest is not a snapshot commit")
-	}
-	m, err := loadManifest(base, commit)
-	if err != nil {
-		return nil, err
-	}
-	v := &state.Version{CommitID: commit, Version: commit, Source: m.Source, ArtifactDigest: artifactDigest(m.Source), Link: link, ManifestDigest: manifestDigest(m)}
-	if _, err = verifySnapshot(ctx, base, v); err != nil {
-		return nil, err
-	}
-	return v, nil
+	return rec.BeforeLink
 }
 
 func normalizeSnapshotLink(t config.Target, link string) (string, error) {
@@ -1260,10 +1222,7 @@ func (r *Runner) checkStoredBaseline(ctx context.Context, t config.Target, st *s
 		return err
 	}
 	defer base.Close()
-	_, live := r.observeLiveCommit(ctx, t, base)
-	if live != nil {
-		st.Current = live
-	} else if st.Current != nil {
+	if st.Current != nil {
 		if _, err = verifySnapshot(ctx, base, st.Current); err != nil {
 			return err
 		}

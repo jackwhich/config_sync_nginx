@@ -175,17 +175,24 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	}
 	if m, e := loadManifest(base, commit); e == nil {
 		link, e := existingSnapshotLink(base, commit)
-		if e != nil {
+		if e == nil {
+			v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: link, ManifestDigest: manifestDigest(m)}
+			if _, e = verifySnapshot(ctx, base, v); e == nil {
+				return v, nil
+			}
+			if m.Source != source {
+				return nil, fmt.Errorf("snapshot source or manifest changed")
+			}
+		} else if !errors.Is(e, os.ErrNotExist) {
 			return nil, e
 		}
-		v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: link, ManifestDigest: manifestDigest(m)}
-		_, e = verifySnapshot(ctx, base, v)
-		return v, e
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
-	if _, e = existingSnapshotLink(base, commit); e == nil {
-		return nil, fmt.Errorf("snapshot exists without a trusted manifest; recovery required")
+	if link, e := existingSnapshotLink(base, commit); e == nil {
+		if e = fsutil.RemoveTree(ctx, base, link); e != nil {
+			return nil, e
+		}
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}

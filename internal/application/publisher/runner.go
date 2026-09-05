@@ -529,15 +529,28 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		return r.fail(st, rec, "TARGET_UNAVAILABLE", e)
 	}
 	defer base.Close()
-	// Validate the real baseline even for a same-commit skip.
+	// Observe live latest for rollback. Never block a publication on stored
+	// baseline drift: identity is the requested commit_id.
+	var liveOK bool
+	var liveCommit, liveSource string
 	e = r.step(prep, st, rec, "verify_baseline", func(c context.Context) error {
-		link, e := r.verifyBaseline(c, t, base, st, req.CommitID)
-		if e != nil {
-			return e
+		if err := c.Err(); err != nil {
+			return err
 		}
+		link, live := r.observeLiveCommit(c, t, base)
 		rec.BeforeLink = link
-		rec.Baseline = st.Current
-		if st.Current != nil {
+		if live != nil {
+			liveOK = true
+			liveCommit = live.CommitID
+			liveSource = live.Source
+			if st.Current != nil && st.Current.CommitID != live.CommitID {
+				st.Previous = st.Current
+			}
+			st.Current = live
+			rec.Baseline = live
+			rec.Result.PreviousCommitID = live.CommitID
+		} else if st.Current != nil {
+			rec.Baseline = st.Current
 			rec.Result.PreviousCommitID = st.Current.CommitID
 		}
 		return nil
@@ -546,9 +559,9 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
 			return r.fail(st, rec, "BASELINE_CHECK_CANCELLED", e)
 		}
-		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
 	}
-	if st.Current != nil && st.Current.CommitID == req.CommitID && st.Current.Source == source && snapshotCommit(rec.BeforeLink) == req.CommitID {
+	if liveOK && liveCommit == req.CommitID && liveSource == source {
 		for _, existing := range st.Records {
 			if existing.Candidate != nil && existing.Candidate.CommitID == req.CommitID && existing.Candidate.Source == source && existing.Result.Status == release.NodeStatusSucceeded && resumableNginxPhase(existing.Result.Phase) {
 				result := existing.Result
@@ -1179,48 +1192,28 @@ type errorMarker struct{}
 
 func (errorMarker) Error() string { return "service stopped before activation" }
 
-// verifyBaseline uses the live latest commit as the rollback baseline for a
-// publication. Stored Current is only a fallback when latest is missing or
-// unverified. Identity is commit_id: a request proceeds unless no verified
-// snapshot can be established at all.
-func (r *Runner) verifyBaseline(ctx context.Context, t config.Target, base *os.Root, st *state.TargetState, incoming string) (string, error) {
+// observeLiveCommit reads latest. A verified snapshot is returned for skip and
+// rollback; a diverged or missing link never fails the publication.
+func (r *Runner) observeLiveCommit(ctx context.Context, t config.Target, base *os.Root) (string, *state.Version) {
 	raw, err := fsutil.Link(base)
+	if err != nil || raw == "" {
+		return "", nil
+	}
+	live, err := normalizeSnapshotLink(t, raw)
 	if err != nil {
-		return "", err
+		return "", nil
 	}
-	live, normErr := normalizeSnapshotLink(t, raw)
-	if normErr != nil {
-		live = ""
+	adopted, err := versionFromLiveSnapshot(ctx, base, live)
+	if err != nil {
+		return live, nil
 	}
-	expected := ""
-	if st.Current != nil {
-		expected, err = normalizeSnapshotLink(t, st.Current.Link)
-		if err != nil {
-			expected = ""
-		}
-	}
-	if live != expected {
-		if st.Current != nil && snapshotCommit(live) != "" && snapshotCommit(live) == snapshotCommit(expected) {
-			migrated := *st.Current
-			migrated.Link = live
-			if _, err = verifySnapshot(ctx, base, &migrated); err != nil {
-				return "", err
-			}
-			st.Current = &migrated
-		} else if live, err = r.realignBaseline(ctx, t, base, st, incoming, live); err != nil {
-			return "", fmt.Errorf("live latest differs from authoritative baseline")
-		}
-	}
-	if err = r.verify(ctx, t, base, st.Current); err != nil {
-		return "", err
-	}
-	return live, nil
+	return live, adopted
 }
 
 func versionFromLiveSnapshot(ctx context.Context, base *os.Root, link string) (*state.Version, error) {
 	commit := snapshotCommit(link)
 	if !release.IsCommit(commit) {
-		return nil, fmt.Errorf("live latest differs from authoritative baseline")
+		return nil, fmt.Errorf("latest is not a snapshot commit")
 	}
 	m, err := loadManifest(base, commit)
 	if err != nil {
@@ -1231,38 +1224,6 @@ func versionFromLiveSnapshot(ctx context.Context, base *os.Root, link string) (*
 		return nil, err
 	}
 	return v, nil
-}
-
-func (r *Runner) realignBaseline(ctx context.Context, t config.Target, base *os.Root, st *state.TargetState, incoming, live string) (string, error) {
-	stored := ""
-	if st.Current != nil {
-		stored = st.Current.CommitID
-	}
-	if live != "" {
-		if adopted, err := versionFromLiveSnapshot(ctx, base, live); err == nil {
-			applog.LogWarn("按现场 latest 的 commit 对齐发布基线", "baseline_realigned", map[string]any{"env": t.Env, "node_id": r.cfg.NodeID, "target_id": t.ID, "stored_commit_id": stored, "live_commit_id": adopted.CommitID, "incoming_commit_id": incoming})
-			if st.Current != nil && st.Current.CommitID != adopted.CommitID {
-				st.Previous = st.Current
-			}
-			st.Current = adopted
-			return live, nil
-		}
-	}
-	if st.Current == nil {
-		return "", fmt.Errorf("live latest differs from authoritative baseline")
-	}
-	if _, err := verifySnapshot(ctx, base, st.Current); err != nil {
-		return "", err
-	}
-	if err := fsutil.Switch(base, st.Current.Link); err != nil {
-		return "", err
-	}
-	applog.LogWarn("现场 latest 不可用，按状态中的 commit 切回基线", "baseline_realigned", map[string]any{"env": t.Env, "node_id": r.cfg.NodeID, "target_id": t.ID, "stored_commit_id": stored, "incoming_commit_id": incoming})
-	expected, err := normalizeSnapshotLink(t, st.Current.Link)
-	if err != nil {
-		return "", err
-	}
-	return expected, nil
 }
 
 func normalizeSnapshotLink(t config.Target, link string) (string, error) {
@@ -1299,8 +1260,13 @@ func (r *Runner) checkStoredBaseline(ctx context.Context, t config.Target, st *s
 		return err
 	}
 	defer base.Close()
-	if _, err = r.verifyBaseline(ctx, t, base, st, ""); err != nil {
-		return err
+	_, live := r.observeLiveCommit(ctx, t, base)
+	if live != nil {
+		st.Current = live
+	} else if st.Current != nil {
+		if _, err = verifySnapshot(ctx, base, st.Current); err != nil {
+			return err
+		}
 	}
 	return r.verifyRetainedAssets(ctx, t, base, st, nil)
 }

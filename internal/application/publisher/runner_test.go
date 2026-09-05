@@ -637,8 +637,12 @@ func TestDriftAndCorruptSnapshotDoNotSkip(t *testing.T) {
 		t.Fatal(e)
 	}
 	got := f.r.Apply(context.Background(), f.request(a))
-	if got.Status != release.NodeStatusRecoveryRequired {
-		t.Fatalf("bad baseline skipped: %+v", got)
+	if got.Status != release.NodeStatusSucceeded {
+		t.Fatalf("corrupt snapshot blocked republish: %+v", got)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || link != a || st.RecoveryRequired {
+		t.Fatalf("republish state: %+v %s", st, link)
 	}
 }
 
@@ -650,7 +654,7 @@ func TestMissingLatestIsRepairedForSameCommit(t *testing.T) {
 		t.Fatal(e)
 	}
 	got := f.r.Apply(context.Background(), f.request(a))
-	if got.Status != release.NodeStatusSkipped {
+	if got.Status != release.NodeStatusSucceeded {
 		t.Fatalf("missing latest was not repaired: %+v", got)
 	}
 	st, link := f.current()

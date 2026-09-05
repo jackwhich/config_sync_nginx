@@ -116,7 +116,7 @@ func TestTypeOnlyPublishRestartRollbackAndOverlap(t *testing.T) {
 		t.Fatal(failed)
 	}
 	link, err := os.Readlink(filepath.Join(st.Target.Dir, "latest"))
-	if err != nil || link != a {
+	if err != nil || snapshotCommit(link) != a && link != filepath.Join(st.Target.Dir, a) {
 		t.Fatal(link, err)
 	}
 	st, err = f.r.store.Load(first.TargetID)

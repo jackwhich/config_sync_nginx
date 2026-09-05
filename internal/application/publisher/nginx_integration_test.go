@@ -130,7 +130,7 @@ fi
 				t.Fatal(got)
 			}
 			st, link := f.current()
-			if st.Current.CommitID != a || link != f.cfg.Targets[0].SnapshotLink(a) {
+			if st.Current.CommitID != a || snapshotCommit(link) != a {
 				t.Fatal(st, link)
 			}
 			raw, err := os.ReadFile(calls)
@@ -138,7 +138,7 @@ fi
 				t.Fatal(string(raw), err)
 			}
 			raw, err = os.ReadFile(links)
-			aLink, bLink := f.cfg.Targets[0].SnapshotLink(a), f.cfg.Targets[0].SnapshotLink(b)
+			aLink, bLink := filepath.Join(f.cfg.Targets[0].Dir, a), filepath.Join(f.cfg.Targets[0].Dir, b)
 			want := strings.Join([]string{aLink, aLink, bLink, aLink, aLink, bLink, bLink, aLink, aLink}, "\n") + "\n"
 			if err != nil || string(raw) != want {
 				t.Fatal("test/reload order", string(raw), err)

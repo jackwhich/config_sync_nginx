@@ -331,6 +331,9 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	if e = fsutil.SyncDir(base, path.Dir(t.SnapshotLink(commit))); e != nil {
 		return nil, e
 	}
+	if e = fsutil.OwnWWW(filepath.Join(t.Dir, t.SnapshotLink(commit))); e != nil {
+		return nil, e
+	}
 	b, _ := json.Marshal(m)
 	if e = fsutil.AtomicWrite(base, ".manifests/"+commit+".json", b, 0600); e != nil {
 		return nil, e

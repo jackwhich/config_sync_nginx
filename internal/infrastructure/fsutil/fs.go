@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"nginx_updata_config/internal/domain/release"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -152,9 +154,17 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	return r.r.Read(p)
 }
 func Reader(ctx context.Context, r io.Reader) io.Reader { return &contextReader{ctx, r} }
-func Switch(r *os.Root, target string) error {
+
+// Switch atomically points latest at a snapshot under rootPath.
+// The symlink target is an absolute path so Nginx include/root resolutions
+// that follow latest keep working after the process cwd changes.
+func Switch(rootPath string, r *os.Root, target string) error {
 	if target != "" && (!fs.ValidPath(target) || (!strings.HasPrefix(target, "releases/") && !release.IsCommit(target))) {
 		return fmt.Errorf("unsafe link target %q", target)
+	}
+	rootPath, err := Canonical(rootPath)
+	if err != nil {
+		return err
 	}
 	if target == "" {
 		err := r.Remove("latest")
@@ -163,15 +173,65 @@ func Switch(r *os.Root, target string) error {
 		}
 		return SyncDir(r, ".")
 	}
+	absTarget := filepath.Join(rootPath, filepath.FromSlash(target))
+	if !strings.HasPrefix(absTarget, rootPath+string(os.PathSeparator)) {
+		return fmt.Errorf("unsafe absolute link target %q", absTarget)
+	}
 	tmp := ".latest-" + release.ID()
-	defer r.Remove(tmp)
-	if err := r.Symlink(target, tmp); err != nil {
+	tmpPath := filepath.Join(rootPath, tmp)
+	defer os.Remove(tmpPath)
+	if err := os.Symlink(absTarget, tmpPath); err != nil {
 		return err
 	}
 	if err := r.Rename(tmp, "latest"); err != nil {
 		return err
 	}
 	return SyncDir(r, ".")
+}
+
+// OwnWWW recursively sets owner/group to www:www for snapshot directories.
+// latest is left alone (typically root). No-op when not root or www is missing.
+func OwnWWW(path string) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	uid, gid, err := wwwIDs()
+	if err != nil {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return os.Lchown(path, uid, gid)
+	}
+	return filepath.Walk(path, func(p string, _ os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return os.Lchown(p, uid, gid)
+	})
+}
+
+func wwwIDs() (uid, gid int, err error) {
+	u, err := user.Lookup("www")
+	if err != nil {
+		return 0, 0, err
+	}
+	g, err := user.LookupGroup("www")
+	if err != nil {
+		return 0, 0, err
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, err
+	}
+	gid, err = strconv.Atoi(g.Gid)
+	if err != nil {
+		return 0, 0, err
+	}
+	return uid, gid, nil
 }
 func Link(r *os.Root) (string, error) {
 	s, err := r.Readlink("latest")

@@ -166,7 +166,7 @@ func AdoptBaseline(ctx context.Context, cfg config.Config, targetID, branch, com
 	if e = stStore.Save(st); e != nil {
 		return e
 	}
-	if e = fsutil.Switch(base, candidate.Link); e != nil {
+	if e = fsutil.Switch(target.Dir, base, candidate.Link); e != nil {
 		return e
 	}
 	e = rt.Test(ctx)

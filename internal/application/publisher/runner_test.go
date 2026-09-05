@@ -133,9 +133,13 @@ func (f *fixture) current() (*state.TargetState, string) {
 		f.t.Fatal(e)
 	}
 	defer base.Close()
-	link, e := fsutil.Link(base)
+	raw, e := fsutil.Link(base)
 	if e != nil {
 		f.t.Fatal(e)
+	}
+	link, e := normalizeSnapshotLink(f.cfg.Targets[0], raw)
+	if e != nil {
+		f.t.Fatalf("latest link %q: %v", raw, e)
 	}
 	return st, link
 }
@@ -162,6 +166,10 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 	st, link := f.current()
 	if st.Current.CommitID != a || link != a || st.Revision == req.ExpectedStateRevision {
 		t.Fatal("activation/state mismatch")
+	}
+	raw, err := os.Readlink(filepath.Join(f.cfg.Targets[0].Dir, "latest"))
+	if err != nil || raw != filepath.Join(f.cfg.Targets[0].Dir, a) {
+		t.Fatalf("latest must be an absolute snapshot path: %q %v", raw, err)
 	}
 	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, "releases")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("config release unexpectedly created releases directory: %v", err)

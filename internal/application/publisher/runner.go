@@ -647,7 +647,7 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 		if e := c.Err(); e != nil {
 			return e
 		}
-		return fsutil.Switch(base, rec.Candidate.Link)
+		return fsutil.Switch(t.Dir, base, rec.Candidate.Link)
 	})
 	if e != nil {
 		return r.restore(t, st, rec, "ACTIVATION_FAILED", e)
@@ -1098,7 +1098,7 @@ func (r *Runner) restoreLocal(ctx context.Context, t config.Target, base *os.Roo
 	if e := ctx.Err(); e != nil {
 		return e
 	}
-	if e := fsutil.Switch(base, rollbackLink(t, rec)); e != nil {
+	if e := fsutil.Switch(t.Dir, base, rollbackLink(t, rec)); e != nil {
 		return e
 	}
 	if _, e := r.nginxTest(ctx); e != nil {

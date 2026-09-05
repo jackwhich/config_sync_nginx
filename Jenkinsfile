@@ -94,7 +94,6 @@ pipeline {
           env.RELEASE_ACTION = params.ACTION
           env.RELEASE_SERVER_NAME = params.SERVER_NAME
           env.RELEASE_URLS = env["SERVICE_URLS_${params.SERVER_NAME.replace('-', '_')}"]
-          if (env.RELEASE_TYPE != 'config') { error('本 Job 仅支持 RELEASE_TYPE=config') }
           if (!env.RELEASE_URLS?.trim()) { error('未配置该站点的节点 HTTP 地址') }
           if (env.RELEASE_ACTION == 'update') {
             env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()

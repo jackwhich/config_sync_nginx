@@ -77,7 +77,7 @@ pipeline {
                 node="$RELEASE_NODE_URL"
                 echo "GET $node/healthz"
                 health="$(curl -sS --max-time 30 "$node/healthz")"
-                echo "$health"
+                printf '%s' "$health" > health-response.json
                 echo "$health" | grep -Eq '"release_contract"[[:space:]]*:[[:space:]]*2' || { echo 'release_contract 必须为 2'; exit 1; }
                 echo "$health" | grep -Eq '"publish_ready"[[:space:]]*:[[:space:]]*true' || { echo '节点 publish_ready 不为 true'; exit 1; }
                 echo "POST $node/api/v1/releases/apply"
@@ -98,19 +98,40 @@ pipeline {
                 error("HTTP ${code}，无法解析节点发布响应")
               }
 
-              echo '========== Nginx 关键执行日志 =========='
-              echo "node=${env.RELEASE_NODE_URL}  release_id=${response.release_id ?: '-'}"
-              def nginxSteps = (response.steps ?: []).findAll { step -> step.name in ['nginx_test', 'reload'] }
-              if (nginxSteps.isEmpty()) {
-                echo '节点响应中没有 nginx_test / reload 步骤。'
-              } else {
-                nginxSteps.each { step ->
-                  echo "[${step.name}] status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
-                  echo(step.message ?: '(命令没有返回标准输出)')
+              def healthText = readFile('health-response.json')
+              def health
+              try {
+                health = new groovy.json.JsonSlurperClassic().parseText(healthText)
+              } catch (Exception ignored) {
+                echo "健康检查响应不是有效 JSON：\n${healthText}"
+                error('无法识别发布节点主机名')
+              }
+
+              def steps = response.steps ?: []
+              def showStep = { title, name ->
+                def step = steps.find { item -> item.name == name }
+                if (step == null) {
+                  echo "${title}: 未执行"
+                } else {
+                  echo "${title}: status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
+                  if (step.message) {
+                    echo "  ${step.message}"
+                  }
                 }
               }
-              echo '=========================================='
-              echo "发布结果：status=${response.status ?: '-'} activation=${response.activation_status ?: '-'} HTTP ${code}"
+
+              echo '========== 节点发布详情 =========='
+              echo "节点主机：${health.node_id ?: 'unknown'}  服务地址：${env.RELEASE_NODE_URL}"
+              echo "发布对象：type=${response.type ?: env.RELEASE_TYPE} server_name=${response.server_name ?: env.RELEASE_SERVER_NAME} commit=${response.commit_id ?: env.RELEASE_COMMIT}"
+              echo "release_id=${response.release_id ?: '-'}"
+              showStep("Git 更新（branch=${env.RELEASE_BRANCH}）", 'fetch')
+              showStep('配置快照准备', 'prepare_snapshot')
+              showStep('切换 latest', 'switch')
+              showStep('Nginx 配置检测（nginx -t）', 'nginx_test')
+              showStep('Nginx 重载（nginx -s reload）', 'reload')
+              showStep('生效验证', 'verify_activation')
+              echo "节点完成：${health.node_id ?: 'unknown'} status=${response.status ?: '-'} activation=${response.activation_status ?: '-'} HTTP ${code}"
+              echo '=================================='
               if (code != '200') {
                 echo "完整发布响应：\n${groovy.json.JsonOutput.prettyPrint(responseText)}"
                 error("节点发布失败，HTTP ${code}")

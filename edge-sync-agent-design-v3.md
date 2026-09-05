@@ -260,7 +260,7 @@ HTTP 访问日志 event=http_access：`request_id`、`node_id`、`env`、`client
 
 日志记录每个进入处理器的请求，包括认证失败、IP 拒绝、未知路由、限流与 panic；2xx/3xx 为 info、4xx 为 warn、5xx/panic 为 error。异常恢复在尚未写响应时返回 500。IP 与授权使用同一可信代理链解析；没有可信客户地址时为空，不使用伪造头。请求体、Token、查询字符串和完整头集合不写日志。
 
-业务步骤与结果日志记录 release_id、target_id、有限阶段、业务 status、rollback_status 和耗时；失败使用 error。清理失败使用 warn。启动和 HTTP 服务器内部错误也通过 JSON 日志器输出。非 HTTP 事件没有访问 IP/HTTP 状态码时不补造数值。
+业务步骤与结果日志记录 release_id、target_id、type、server_name、commit_id、有限阶段、业务 status、rollback_status 和耗时；成功的 release_result 可作为发布成功审计事件，失败使用 error。清理失败使用 warn。启动和 HTTP 服务器内部错误也通过 JSON 日志器输出。非 HTTP 事件没有访问 IP/HTTP 状态码时不补造数值。
 
 ### 11.2 指标契约
 
@@ -280,9 +280,9 @@ HTTP 访问日志 event=http_access：`request_id`、`node_id`、`env`、`client
 | target_recovery_required | Gauge，env/release_type/target_id | 目标是否待恢复 |
 | release_in_progress | Gauge，env/release_type/target_id | 是否正在处理发布事务 |
 | release_started_timestamp_seconds | Gauge，env/release_type/target_id | 当前事务开始时间，空闲为 0 |
-| last_success_timestamp_seconds | Gauge，env/release_type/target_id | 当前持久版本验证时间，无版本为 0 |
+| last_success_timestamp_seconds | Gauge，env/release_type/server_name/target_id/commit_id | 当前成功激活版本的验证时间，无版本为 0；每个目标仅保留当前 commit_id 标签，用于成功通知 |
 
-commit、release_id、访问 IP 和任意请求 project 不作 Prometheus 标签。未授权/无效请求只影响有限的 HTTP 计数。目标和阶段计数器在启动时建立零值，阶段来自固定枚举（前端为 oras_pull）。恢复标记及当前版本验证时间在 health/metrics 请求时从状态视图刷新，重启后仍可观测；Counter 统计本进程事件，应使用 rate/increase 处理重启。
+release_id、访问 IP 和任意请求 project 不作 Prometheus 标签。`commit_id` 仅用于 `last_success_timestamp_seconds` 的当前成功版本标签：新版本会删除同一目标的旧标签，因此不作为累计计数器的高基数标签。未授权/无效请求只影响有限的 HTTP 计数。目标和阶段计数器在启动时建立零值，阶段来自固定枚举（前端为 oras_pull）。恢复标记及当前版本验证时间在 health/metrics 请求时从状态视图刷新，重启后仍可观测；Counter 统计本进程事件，应使用 rate/increase 处理重启。
 
 ### 11.3 告警接入
 

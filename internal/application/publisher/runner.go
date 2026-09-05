@@ -197,10 +197,12 @@ func (r *Runner) Health() map[string]any {
 	reason := r.blocked
 	for _, st := range r.views {
 		verifiedAt := time.Time{}
+		commitID := ""
 		if st.Current != nil {
 			verifiedAt = st.Current.VerifiedAt
+			commitID = st.Current.CommitID
 		}
-		prom.TargetState(st.Target.Env, string(st.Target.Type), st.Target.ID, st.RecoveryRequired, verifiedAt)
+		prom.TargetState(st.Target.Env, string(st.Target.Type), st.Target.ServerName, st.Target.ID, st.RecoveryRequired, verifiedAt, commitID)
 	}
 	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
 	envs := []string{}
@@ -308,7 +310,7 @@ func (r *Runner) ensureTarget(t config.Target) (*state.TargetState, error) {
 	if err := r.save(st); err != nil {
 		return nil, err
 	}
-	prom.InitTarget(t.Env, string(t.Type), t.ID)
+	prom.InitTarget(t.Env, string(t.Type), t.ServerName, t.ID)
 	return st, nil
 }
 
@@ -957,7 +959,7 @@ func (r *Runner) result(rec *state.Record) release.Result {
 	if result.Terminal() {
 		prom.Terminal(result.Env, string(result.Type), result.TargetID, string(result.Status))
 	}
-	fields := map[string]any{"env": result.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
+	fields := map[string]any{"env": result.Env, "node_id": r.cfg.NodeID, "release_id": result.ReleaseID, "target_id": result.TargetID, "type": result.Type, "server_name": result.ServerName, "commit_id": result.CommitID, "phase": result.Phase, "status": result.Status, "status_code": result.HTTPStatus, "error_code": result.ErrorCode, "duration_ms": time.Since(result.StartedAt).Milliseconds(), "rollback_status": result.RollbackStatus}
 	if result.ArtifactDigest != "" {
 		fields["artifact_digest"] = result.ArtifactDigest
 	}
@@ -1026,6 +1028,7 @@ func (r *Runner) commit(t config.Target, st *state.TargetState, rec *state.Recor
 	if e := r.save(st); e != nil {
 		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
 	}
+	prom.TargetState(t.Env, string(t.Type), t.ServerName, t.ID, false, rec.Candidate.VerifiedAt, rec.Candidate.CommitID)
 	cleanup, cancel := context.WithTimeout(context.Background(), r.cfg.CleanupTimeout.Value())
 	e := cleanupSnapshots(cleanup, r.cfg, t, st)
 	cancel()

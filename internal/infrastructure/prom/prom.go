@@ -6,6 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -46,12 +47,14 @@ var persistFailures = promauto.NewCounterVec(prometheus.CounterOpts{Namespace: "
 var recovery = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "target_recovery_required", Help: "Persisted target recovery flag (1 or 0)."}, []string{"env", "release_type", "target_id"})
 var active = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "release_in_progress", Help: "Active publication transaction (1 or 0)."}, []string{"env", "release_type", "target_id"})
 var started = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "release_started_timestamp_seconds", Help: "Start time of the active publication; zero when idle."}, []string{"env", "release_type", "target_id"})
-var lastSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "last_success_timestamp_seconds", Help: "Verification time of current persisted version; zero if never deployed."}, []string{"env", "release_type", "target_id"})
+var lastSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{Namespace: "nginx_updata_config", Name: "last_success_timestamp_seconds", Help: "Verification time of the current successfully activated version; zero if never deployed."}, []string{"env", "release_type", "server_name", "target_id", "commit_id"})
+var lastSuccessMu sync.Mutex
+var lastSuccessLabels = map[string][]string{}
 
 var phaseNames = []string{"verify_baseline", "fetch", "oras_pull", "prepare_snapshot", "verify_candidate", "switch", "nginx_test", "reload", "verify_activation"}
 
 // Initialize finite configured series at zero before the first scrape/publication.
-func InitTarget(env, typ, target string) {
+func InitTarget(env, typ, server, target string) {
 	for _, status := range []string{"succeeded", "skipped", "failed"} {
 		terminal.WithLabelValues(env, typ, target, status).Add(0)
 	}
@@ -64,7 +67,7 @@ func InitTarget(env, typ, target string) {
 	cleanupFailures.WithLabelValues(env, typ, target).Add(0)
 	persistFailures.WithLabelValues(env, typ, target).Add(0)
 	Active(env, typ, target, false)
-	TargetState(env, typ, target, false, time.Time{})
+	TargetState(env, typ, server, target, false, time.Time{}, "")
 }
 func Rollback(env, typ, target, status string) {
 	rollback.WithLabelValues(env, typ, target, status).Inc()
@@ -79,7 +82,7 @@ func Active(env, typ, target string, value bool) {
 	active.WithLabelValues(env, typ, target).Set(v)
 	started.WithLabelValues(env, typ, target).Set(timestamp)
 }
-func TargetState(env, typ, target string, needsRecovery bool, verifiedAt time.Time) {
+func TargetState(env, typ, server, target string, needsRecovery bool, verifiedAt time.Time, commit string) {
 	v, timestamp := 0.0, 0.0
 	if needsRecovery {
 		v = 1
@@ -88,5 +91,25 @@ func TargetState(env, typ, target string, needsRecovery bool, verifiedAt time.Ti
 		timestamp = float64(verifiedAt.UnixNano()) / 1e9
 	}
 	recovery.WithLabelValues(env, typ, target).Set(v)
-	lastSuccess.WithLabelValues(env, typ, target).Set(timestamp)
+	labels := []string{env, typ, server, target, commit}
+	key := env + "\x00" + typ + "\x00" + target
+	lastSuccessMu.Lock()
+	if previous, ok := lastSuccessLabels[key]; ok && !sameLabels(previous, labels) {
+		lastSuccess.DeleteLabelValues(previous...)
+	}
+	lastSuccessLabels[key] = labels
+	lastSuccess.WithLabelValues(labels...).Set(timestamp)
+	lastSuccessMu.Unlock()
+}
+
+func sameLabels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

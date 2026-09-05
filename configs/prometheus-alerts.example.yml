@@ -7,6 +7,13 @@ groups:
           severity: warning
         annotations:
           summary: 'Nginx HTTP publication failed for {{ $labels.target_id }}'
+      - alert: NginxHTTPReleaseSucceeded
+        expr: time() - nginx_updata_config_last_success_timestamp_seconds > 0 and time() - nginx_updata_config_last_success_timestamp_seconds < 120
+        labels:
+          severity: info
+        annotations:
+          summary: 'Nginx {{ $labels.release_type }} published successfully on {{ $labels.server_name }}'
+          description: 'commit_id={{ $labels.commit_id }}, target_id={{ $labels.target_id }}'
       - alert: NginxHTTPReleaseUnavailable
         expr: up{job="nginx-http-release"} == 0
         for: 2m

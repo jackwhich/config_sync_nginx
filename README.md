@@ -211,13 +211,14 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 访问日志覆盖进入处理器的成功、401/403、404/405、限流和 500 请求。2xx/3xx 为 info，4xx 为 warn，5xx/异常为 error。`client_ip` 使用与访问控制相同的可信代理解析，`peer_ip` 为实际连接来源；响应头 `X-Request-ID` 可关联日志。发布请求还记录 `release_id/target_id/release_status/error_code`。不记录 Token、请求体、查询字符串或全部请求头。
 
-发布步骤和最终结果日志包含 `release_id`、`target_id`、`status`、`duration_ms`，失败使用 error 级别。服务内部及启动失败日志也使用 JSON。非 HTTP 事件不伪造访问 IP 或 HTTP 状态码。
+发布步骤和最终结果日志包含 `release_id`、`target_id`、`type`、`server_name`、`commit_id`、`phase`、`status`、`duration_ms`；成功的 `release_result` 可直接作为发布成功审计事件，失败使用 error 级别。服务内部及启动失败日志也使用 JSON。非 HTTP 事件不伪造访问 IP 或 HTTP 状态码。
 
-`GET /metrics` 输出 Prometheus 指标。完整清单见 [设计文档的可观测性章节](edge-sync-agent-design-v3.md#十一可观测性)。已配置目标的计数器启动时初始化为 0，幂等重放不会增加发布结果计数；`commit/release_id/client_ip` 不作为指标标签。
+`GET /metrics` 输出 Prometheus 指标。完整清单见 [设计文档的可观测性章节](edge-sync-agent-design-v3.md#十一可观测性)。已配置目标的计数器启动时初始化为 0，幂等重放不会增加发布结果计数；`release_id/client_ip` 不作为指标标签。当前成功版本指标保留单个 `commit_id` 标签，使成功通知能显示该提交；同一目标的新版本会替换旧版本标签，不会累积活跃提交序列。
 
 | 告警 | 默认触发条件 |
 | --- | --- |
 | NginxHTTPReleaseFailed | 10 分钟内发布失败 |
+| NginxHTTPReleaseSucceeded | 发布成功后 2 分钟内触发信息通知，包含 type、server_name、commit_id |
 | NginxHTTPReleaseUnavailable | Prometheus 连续 2 分钟抓取失败 |
 | NginxHTTPReleaseNeedsRecovery | 发布不可用持续 1 分钟 |
 | NginxHTTPReleaseStepFailed | 10 分钟内任一发布步骤失败，可按 step 定位 Git、oras_pull、nginx_test、reload 等 |

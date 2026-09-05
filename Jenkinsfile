@@ -107,34 +107,78 @@ pipeline {
                 error('无法识别发布节点主机名')
               }
 
-              def steps = response.steps ?: []
-              def showStep = { title, name ->
-                def step = steps.find { item -> item.name == name }
-                if (step == null) {
-                  echo "${title}: 未执行"
-                } else {
-                  echo "${title}: status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
-                  if (step.message) {
-                    echo "  ${step.message}"
+              def showRelease = { title, result, statusCode ->
+                def steps = result.steps ?: []
+                def showStep = { stepTitle, name ->
+                  def step = steps.find { item -> item.name == name }
+                  if (step == null) {
+                    echo "${stepTitle}: 未执行"
+                  } else {
+                    echo "${stepTitle}: status=${step.status ?: 'unknown'} duration_ms=${step.duration_ms ?: 0}"
+                    if (step.message) {
+                      echo "  ${step.message}"
+                    }
                   }
                 }
+                echo "========== 节点发布详情：${title} =========="
+                echo "节点主机：${health.node_id ?: 'unknown'}  服务地址：${env.RELEASE_NODE_URL}"
+                echo "发布对象：type=${result.type ?: env.RELEASE_TYPE} server_name=${result.server_name ?: env.RELEASE_SERVER_NAME} commit=${result.commit_id ?: env.RELEASE_COMMIT}"
+                echo "release_id=${result.release_id ?: '-'}"
+                showStep("Git 更新（branch=${env.RELEASE_BRANCH}）", 'fetch')
+                showStep('配置快照准备', 'prepare_snapshot')
+                showStep('切换 latest', 'switch')
+                showStep('Nginx 配置检测（nginx -t）', 'nginx_test')
+                showStep('Nginx 重载（nginx -s reload）', 'reload')
+                showStep('生效验证', 'verify_activation')
+                echo "节点状态：${health.node_id ?: 'unknown'} status=${result.status ?: '-'} activation=${result.activation_status ?: '-'} HTTP ${statusCode}"
+                echo '=========================================='
+              }
+              def failResponse = { title, payload, statusCode ->
+                echo "${title}失败，HTTP ${statusCode}：\n${groovy.json.JsonOutput.prettyPrint(payload)}"
+                error("节点发布失败：${title}，HTTP ${statusCode}")
+              }
+              def invokeNginxCommand = { path, requestFile, responseFile ->
+                writeFile file: requestFile, text: groovy.json.JsonOutput.toJson([
+                  env: env.RELEASE_ENV,
+                  release_id: response.release_id
+                ])
+                def commandCode = sh(script: """
+                  set -eu
+                  code=\"\$(curl -sS -o '${responseFile}' -w '%{http_code}' --max-time 120 \\
+                    -X POST \"\$RELEASE_NODE_URL${path}\" \\
+                    -H 'Content-Type: application/json' \\
+                    -H \"X-Release-Token: \$RELEASE_TOKEN\" \\
+                    --data-binary @'${requestFile}')\"
+                  printf '%s' \"\$code\"
+                """, returnStdout: true).trim()
+                def commandText = readFile(responseFile)
+                def commandResponse
+                try {
+                  commandResponse = new groovy.json.JsonSlurperClassic().parseText(commandText)
+                } catch (Exception ignored) {
+                  echo "${path} 响应不是有效 JSON：\n${commandText}"
+                  error("HTTP ${commandCode}，无法解析节点响应")
+                }
+                [code: commandCode, text: commandText, result: commandResponse]
               }
 
-              echo '========== 节点发布详情 =========='
-              echo "节点主机：${health.node_id ?: 'unknown'}  服务地址：${env.RELEASE_NODE_URL}"
-              echo "发布对象：type=${response.type ?: env.RELEASE_TYPE} server_name=${response.server_name ?: env.RELEASE_SERVER_NAME} commit=${response.commit_id ?: env.RELEASE_COMMIT}"
-              echo "release_id=${response.release_id ?: '-'}"
-              showStep("Git 更新（branch=${env.RELEASE_BRANCH}）", 'fetch')
-              showStep('配置快照准备', 'prepare_snapshot')
-              showStep('切换 latest', 'switch')
-              showStep('Nginx 配置检测（nginx -t）', 'nginx_test')
-              showStep('Nginx 重载（nginx -s reload）', 'reload')
-              showStep('生效验证', 'verify_activation')
-              echo "节点完成：${health.node_id ?: 'unknown'} status=${response.status ?: '-'} activation=${response.activation_status ?: '-'} HTTP ${code}"
-              echo '=================================='
-              if (code != '200') {
-                echo "完整发布响应：\n${groovy.json.JsonOutput.prettyPrint(responseText)}"
-                error("节点发布失败，HTTP ${code}")
+              showRelease('同步并切换 latest', response, code)
+              if (code == '200' && response.status == 'skipped') {
+                echo '该节点已是目标提交，跳过 nginx -t 和 reload。'
+              } else {
+                if (code != '202' || response.status != 'running' || response.phase != 'awaiting_nginx_test') {
+                  failResponse('同步并切换 latest', responseText, code)
+                }
+                def tested = invokeNginxCommand('/api/v1/releases/nginx/test', 'nginx-test-request.json', 'nginx-test-response.json')
+                showRelease('nginx -t', tested.result, tested.code)
+                if (tested.code != '202' || tested.result.status != 'running' || tested.result.phase != 'awaiting_nginx_reload') {
+                  failResponse('nginx -t', tested.text, tested.code)
+                }
+                def reloaded = invokeNginxCommand('/api/v1/releases/nginx/reload', 'nginx-reload-request.json', 'nginx-reload-response.json')
+                showRelease('nginx -s reload 与生效验证', reloaded.result, reloaded.code)
+                if (reloaded.code != '200' || reloaded.result.status != 'succeeded') {
+                  failResponse('nginx -s reload', reloaded.text, reloaded.code)
+                }
               }
             }
           }
@@ -144,6 +188,6 @@ pipeline {
   }
   post {
     success { echo 'HTTP 发布完成。' }
-    failure { echo '发布失败，具体检查/reload 错误见上方控制台。配置/白名单 Job 不提供 rollback；修复提交后重新 update。' }
+    failure { echo '发布失败，具体 Git、nginx -t、reload 及自动恢复结果见上方控制台。若节点进入 recovery_required，请先恢复该节点再重新发布。' }
   }
 }

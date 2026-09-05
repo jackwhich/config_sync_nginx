@@ -62,14 +62,35 @@ func TestMinimalHTTPPublishAndEnvironmentTokenBinding(t *testing.T) {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	rec := post("uat-token")
-	if rec.Code != 200 {
+	if rec.Code != 202 {
 		t.Fatal(rec.Code, rec.Body.String())
 	}
 	var result release.Result
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != release.NodeStatusSucceeded || result.Env != "uat" || !release.IsID(result.ReleaseID) {
+	if result.Status != release.NodeStatusRunning || result.Phase != "awaiting_nginx_test" || result.Env != "uat" || !release.IsID(result.ReleaseID) {
+		t.Fatal(result)
+	}
+	command := func(path, token string) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(release.NginxCommandRequest{Env: "uat", ReleaseID: result.ReleaseID})
+		req := httptest.NewRequest("POST", path, bytes.NewReader(b))
+		req.Header.Set("X-Release-Token", token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := command("/api/v1/releases/nginx/test", "uat-token"); rec.Code != 202 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	rec = command("/api/v1/releases/nginx/reload", "uat-token")
+	if rec.Code != 200 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != release.NodeStatusSucceeded {
 		t.Fatal(result)
 	}
 	for _, env := range []string{"uat", "prod"} {

@@ -20,6 +20,9 @@ import (
 // Publisher is the HTTP adapter's application contract.
 type Publisher interface {
 	Apply(context.Context, release.ApplyRequest) release.Result
+	Stage(context.Context, release.ApplyRequest) release.Result
+	NginxTest(context.Context, release.NginxCommandRequest) release.Result
+	NginxReload(context.Context, release.NginxCommandRequest) release.Result
 	Health() map[string]any
 	Target(string) (config.Target, bool)
 	Resolve(release.ReleaseType, string, string, string, ...string) (config.Target, error)
@@ -35,6 +38,8 @@ type Server struct {
 func New(r Publisher, cfg config.Config) *Server {
 	s := &Server{runner: r, cfg: cfg, mux: http.NewServeMux(), slots: make(chan struct{}, cfg.MaxConcurrentRequests)}
 	s.mux.HandleFunc("POST /api/v1/releases/apply", s.apply)
+	s.mux.HandleFunc("POST /api/v1/releases/nginx/test", s.nginxTest)
+	s.mux.HandleFunc("POST /api/v1/releases/nginx/reload", s.nginxReload)
 	s.mux.HandleFunc("GET /api/v1/releases/state", s.state)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, s.runner.Health()) })
 	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) { s.runner.Health(); prom.MetricsHandler().ServeHTTP(w, r) })
@@ -51,6 +56,10 @@ func (s *Server) Handler() http.Handler {
 		switch r.URL.Path {
 		case "/api/v1/releases/apply":
 			handler = "apply"
+		case "/api/v1/releases/nginx/test":
+			handler = "nginx_test"
+		case "/api/v1/releases/nginx/reload":
+			handler = "nginx_reload"
 		case "/api/v1/releases/state":
 			handler = "state"
 		case "/healthz":
@@ -174,7 +183,53 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, strings.TrimSpace(req.Env)) {
 		return
 	}
-	result := s.runner.Apply(r.Context(), req)
+	result := s.runner.Stage(r.Context(), req)
+	s.writeReleaseResult(w, result)
+}
+
+func (s *Server) nginxTest(w http.ResponseWriter, r *http.Request) {
+	s.nginxCommand(w, r, s.runner.NginxTest)
+}
+
+func (s *Server) nginxReload(w http.ResponseWriter, r *http.Request) {
+	s.nginxCommand(w, r, s.runner.NginxReload)
+}
+
+func (s *Server) nginxCommand(w http.ResponseWriter, r *http.Request, run func(context.Context, release.NginxCommandRequest) release.Result) {
+	if !s.authorize(w, r) {
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxRequestBytes)
+	var req release.NginxCommandRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&req)
+	if err == nil {
+		var extra any
+		if next := dec.Decode(&extra); next != io.EOF {
+			if next == nil {
+				err = errors.New("only one JSON object is allowed")
+			} else {
+				err = next
+			}
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Env) == "" || !s.cfg.AcceptsEnv(strings.TrimSpace(req.Env)) {
+		writeError(w, http.StatusForbidden, "ENV_NOT_ALLOWED", "environment does not match this node")
+		return
+	}
+	if !s.authorize(w, r, strings.TrimSpace(req.Env)) {
+		return
+	}
+	s.writeReleaseResult(w, run(r.Context(), req))
+}
+
+func (s *Server) writeReleaseResult(w http.ResponseWriter, result release.Result) {
 	if cw, ok := w.(*captureWriter); ok {
 		if release.IsID(result.ReleaseID) {
 			cw.releaseID = result.ReleaseID

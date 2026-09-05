@@ -49,24 +49,38 @@ class FakeHTTP:
                 state.update(node["records"][release_id])
             return 200, state
         self.calls.append((base, copy.deepcopy(body)))
+        if path in {"/api/v1/releases/nginx/test", "/api/v1/releases/nginx/reload"}:
+            release_id = body["release_id"]
+            record = node["records"].get(release_id)
+            if not record:
+                return 404, {"error_code": "RELEASE_NOT_FOUND"}
+            result = record["release"]
+            if path.endswith("/test"):
+                if base == self.fail_node and not record["restore"]:
+                    result.update(self.failure, status="failed", rollback_status="succeeded")
+                    node["revision"] = str(uuid.uuid4())
+                    result["state_revision_after"] = node["revision"]
+                    return 500, result
+                result.update(status="running", phase="awaiting_nginx_reload", activation_status="nginx_test_passed")
+                return 202, result
+            if result.get("phase") != "awaiting_nginx_reload":
+                return 409, {"error_code": "NGINX_RELOAD_NOT_PENDING"}
+            node["commit"] = record["candidate"]
+            node["revision"] = str(uuid.uuid4())
+            result.update(status="succeeded", phase="complete", activation_status="reload_requested", state_revision_after=node["revision"])
+            return 200, result
         if body["expected_state_revision"] != node["revision"]:
             return 409, {"error_code": "STATE_REVISION_CONFLICT"}
         before = node["commit"]
-        result = {"release_id": body["release_id"], "state_revision_before": node["revision"], "commit_id": body["commit_id"], "status": "succeeded"}
+        result = {"release_id": body["release_id"], "state_revision_before": node["revision"], "commit_id": body["commit_id"], "status": "running", "phase": "awaiting_nginx_test", "activation_status": "latest_switched"}
         if body["type"] == "frontend_static":
             result["artifact_digest"] = body.get("artifact_digest", self.digest_by_node[base])
-        if base == self.fail_node and "restore_of" not in body:
-            result["status"] = "failed"
-            result.update(self.failure)
-        else:
-            node["commit"] = body["commit_id"]
-            node["revision"] = str(uuid.uuid4())
         result["state_revision_after"] = node["revision"]
-        node["records"][body["release_id"]] = {"release": result, "baseline": {"commit_id": before, "version": before, "artifact_digest": "sha256:" + before[0] * 64}}
+        node["records"][body["release_id"]] = {"release": result, "candidate": body["commit_id"], "restore": "restore_of" in body, "baseline": {"commit_id": before, "version": before, "artifact_digest": "sha256:" + before[0] * 64}}
         if self.drop_reply:
             self.drop_reply = False
             raise client.ReleaseError("response lost")
-        return (500 if result["status"] == "failed" else 200), result
+        return 202, result
 
 
 def batch(http):
@@ -83,6 +97,9 @@ class BatchTests(unittest.TestCase):
         self.batch = batch(self.http)
         client.atomic_save(self.path, self.batch)
 
+    def publish_calls(self):
+        return [(url, request) for url, request in self.http.calls if "expected_state_revision" in request]
+
     def test_old_server_preflight_never_posts(self):
         self.http.old_contract = "http://b"
         with self.assertRaises(client.ReleaseError):
@@ -92,11 +109,12 @@ class BatchTests(unittest.TestCase):
     def test_response_lost_resolves_same_id_without_second_publish(self):
         self.http.drop_reply = True
         client.update_batch(self.http, self.batch, self.path)
-        self.assertEqual(len(self.http.calls), 2)
+        self.assertEqual(len(self.http.calls), 6)
+        self.assertEqual(len(self.publish_calls()), 2)
         self.assertEqual(self.batch["phase"], "succeeded")
         recovered = json.loads(self.path.read_text())
         client.update_batch(self.http, recovered, self.path)
-        self.assertEqual(len(self.http.calls), 2)
+        self.assertEqual(len(self.http.calls), 6)
 
     def test_each_node_restores_its_own_baseline(self):
         client.update_batch(self.http, self.batch, self.path)
@@ -111,7 +129,7 @@ class BatchTests(unittest.TestCase):
         self.http.nodes["http://b"]["revision"] = str(uuid.uuid4())
         with self.assertRaisesRegex(client.ReleaseError, "baseline changed"):
             client.restore_batch(self.http, self.batch, self.path)
-        self.assertEqual(len(self.http.calls), 2)
+        self.assertEqual(len(self.http.calls), 6)
 
     def test_partial_failure_stops_and_restores_only_successful_nodes(self):
         self.http.fail_node = "http://b"
@@ -120,7 +138,7 @@ class BatchTests(unittest.TestCase):
             client.update_batch(self.http, self.batch, self.path)
         self.assertEqual(self.batch["phase"], "restored")
         self.assertEqual(self.http.nodes["http://a"]["commit"], "a" * 40)
-        self.assertEqual(len(self.http.calls), 3)
+        self.assertEqual(len(self.http.calls), 8)
         self.assertEqual(self.http.calls[-1][0], "http://a")
 
     def test_nginx_error_stops_next_node_and_preserves_diagnostics_on_resume(self):
@@ -132,7 +150,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn(self.http.failure["error"], saved["error"])
         with self.assertRaisesRegex(client.ReleaseError, "bad_directive"):
             client.update_batch(self.http, saved, self.path)
-        self.assertEqual([url for url, _ in self.http.calls], ["http://a"])
+        self.assertEqual([url for url, _ in self.http.calls], ["http://a", "http://a"])
 
     def test_cli_exits_nonzero_and_prints_nginx_error(self):
         http = self.http
@@ -171,7 +189,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(run.returncode, 1, run.stderr)
         self.assertIn("NGINX_TEST_FAILED", run.stderr)
         self.assertIn(http.failure["error"], run.stderr)
-        self.assertEqual([url for url, _ in http.calls], ["http://a"])
+        self.assertEqual([url for url, _ in http.calls], ["http://a", "http://a"])
 
     def test_batch_must_be_durable_before_post(self):
         with patch.object(client, "atomic_save", side_effect=OSError("disk full")):
@@ -186,7 +204,7 @@ class BatchTests(unittest.TestCase):
         self.http.drop_query = True
         with self.assertRaises(client.ReleaseError):
             client.restore_batch(self.http, self.batch, self.path)
-        self.assertEqual(len(self.http.calls), 2)
+        self.assertEqual(len(self.http.calls), 6)
 
     def test_frontend_requires_oras_capability_before_any_post(self):
         request = dict(self.batch["nodes"][0]["request"], type="frontend_static", artifact_digest="sha256:" + "a" * 64)
@@ -204,14 +222,14 @@ class BatchTests(unittest.TestCase):
         current = self.frontend_batch()
         self.http.drop_reply = True
         client.update_batch(self.http, current, self.path)
-        first, second = self.http.calls
+        first, second = self.publish_calls()
         self.assertNotIn("artifact_digest", first[1])
         self.assertEqual(second[1]["artifact_digest"], self.http.digest_by_node["http://a"])
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["artifact_digest"], second[1]["artifact_digest"])
         self.assertNotIn("artifact_digest", saved["nodes"][0]["request"])
         client.update_batch(self.http, saved, self.path)
-        self.assertEqual(len(self.http.calls), 2)
+        self.assertEqual(len(self.http.calls), 6)
         client.restore_batch(self.http, saved, self.path)
         restores = {url: req["artifact_digest"] for url, req in self.http.calls if "restore_of" in req}
         self.assertEqual(restores, {"http://a": "sha256:" + "a" * 64, "http://b": "sha256:" + "b" * 64})
@@ -222,8 +240,8 @@ class BatchTests(unittest.TestCase):
         saved = json.loads(self.path.read_text())
         self.assertNotIn("artifact_digest", saved)
         client.update_batch(self.http, saved, self.path)
-        self.assertEqual(len(self.http.calls), 2)
-        self.assertEqual(self.http.calls[1][1]["artifact_digest"], self.http.digest_by_node["http://a"])
+        self.assertEqual(len(self.http.calls), 6)
+        self.assertEqual(self.publish_calls()[1][1]["artifact_digest"], self.http.digest_by_node["http://a"])
 
     def test_frontend_never_rewrites_an_unresolved_request_to_add_digest(self):
         current = self.frontend_batch()
@@ -246,7 +264,7 @@ class BatchTests(unittest.TestCase):
         with patch.object(self.http, "call", side_effect=wrong_digest):
             with self.assertRaisesRegex(client.ReleaseError, "digest differs"):
                 client.update_batch(self.http, current, self.path)
-        self.assertEqual([url for url, _ in self.http.calls], ["http://a"])
+        self.assertEqual([url for url, _ in self.http.calls], ["http://a", "http://a", "http://a"])
 
     def test_frontend_sha_only_requires_resolution_capability_before_any_post(self):
         request = dict(self.batch["nodes"][0]["request"], type="frontend_static")
@@ -290,7 +308,7 @@ class BatchTests(unittest.TestCase):
         env = {"RELEASE_ENV": "test", "RELEASE_TYPE": "frontend_static", "RELEASE_BRANCH": "wrong-branch", "RELEASE_COMMIT": "d" * 40, "RELEASE_SERVER_NAME": "wrong-site", "RELEASE_PATH_DEST": "/wrong", "RELEASE_URLS": "http://wrong", "RELEASE_TOKEN": "test-token"}
         self.run_main("resume", env, self.path)
         self.assertEqual(self.http.calls[0][1], original)
-        self.assertEqual([url for url, _ in self.http.calls], ["http://a", "http://b"])
+        self.assertEqual([url for url, _ in self.publish_calls()], ["http://a", "http://b"])
 
     def test_empty_service_list_is_rejected_before_preflight(self):
         env = {"RELEASE_ENV": "test", "RELEASE_TYPE": "config", "RELEASE_COMMIT": "c" * 40, "RELEASE_SERVER_NAME": "site", "RELEASE_PATH_DEST": "/data/root", "RELEASE_URLS": ", ,", "RELEASE_TOKEN": "test-token"}

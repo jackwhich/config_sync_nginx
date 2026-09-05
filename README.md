@@ -1,6 +1,6 @@
 # Nginx HTTP 发布服务
 
-Jenkins 或脚本通过 HTTP 同步调用每台节点。配置/白名单从允许的 Git 仓库提取，前端通过 ORAS 从 Harbor 拉取固定 digest 的 dist.tar.gz，生成不可变快照，切换 `latest`，通过 `nginx -t` 并成功执行 `nginx -s reload` 后原子提交状态。失败时用本节点发布前快照恢复。
+Jenkins 或脚本通过 HTTP 分阶段调用每台节点。配置/白名单从允许的 Git 仓库提取，前端通过 ORAS 从 Harbor 拉取固定 digest 的 dist.tar.gz。`apply` 生成不可变快照并切换 `latest`；随后独立调用 `nginx -t`、`nginx -s reload`，只有 reload 与验证成功才提交状态。失败时用本节点发布前快照恢复。
 
 默认配置只列 `targets: [config, whitelist]`；站点和绝对部署路径从每次 POST 的 `params` 传入，同步后执行已有的 `nginx -t`，通过后执行 `nginx -s reload`。完整约定见 [HTTP 参数与简化配置](docs/request-targets.md)。
 
@@ -50,7 +50,7 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
 - `targets` 只列启用类型，`params.server_name`、`params.path_dest` 每次通过 HTTP 传入，`project` 是可选顶层字段。
 - `data_dir`、环境 Token、日志和各类型的仓库连接信息留在服务配置。默认锁为 `<data_dir>/publish.lock`，已部署节点应保留原锁路径。
 - 主机标识默认来自系统；支持可选 hostname/node_id。服务不读取 Nginx PID、进程列表或启动参数，不要求配置 Nginx 路径。
-- 不要求配置健康检查或业务 URL；默认校验快照、执行 `nginx -t`，通过后执行 `nginx -s reload`。可选 HTTP 探测见 [高级配置](configs/service.advanced.example.yaml)。
+- 不要求配置健康检查或业务 URL；默认校验快照后切换 `latest`，再通过独立 HTTP 接口执行 `nginx -t`、`nginx -s reload`。可选 HTTP 探测见 [高级配置](configs/service.advanced.example.yaml)。
 
 服务配置中的令牌应限制文件读取权限。Nginx 必须具备读取快照文件和遍历部署目录的权限；默认目录 0755、文件 0644，配置可收紧。服务账号需有发布目录、状态目录写权限，并能通过 PATH 中已有的 nginx 执行 `-t` 和 `-s reload`。
 
@@ -84,22 +84,24 @@ Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 
 
 Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch` 传入，服务验证提交位于该分支历史中。默认配置只填写仓库 URL 和凭据。拉取优先使用 Git partial clone 的 `blob:none` 过滤：先获取分支的提交和目录元数据，`git archive` 仅按需取回当前站点目录的文件；GitLab 或节点 Git 客户端不支持该协议时，会自动退回普通 fetch。高级可选项 `allowed_branches` 是额外的分支允许列表，不代替请求 branch；未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 
-发布流程为：拉取 → 校验文件 → 建立完整 SHA 快照 → 原子切换 latest → `nginx -t` → `nginx -s reload` → 校验本地快照（及可选 HTTP 探测）→ 提交状态。检查或 reload 命令失败时恢复旧链接，再执行 `nginx -t`，通过后 reload；恢复失败则阻止后续发布。默认成功结果的 `activation_status` 为 `reload_requested`，表示文件就位且命令成功，不代表检查过 worker 或业务响应。
+发布流程为：`POST /apply` 拉取 → 校验文件 → 建立完整 SHA 快照 → 原子切换 latest（HTTP 202）→ `POST /nginx/test` 执行 `nginx -t`（HTTP 202）→ `POST /nginx/reload` 执行 reload、校验本地快照及可选 HTTP 探测（HTTP 200）→ 提交状态。检查或 reload 命令失败时恢复旧链接，再执行旧配置的 `nginx -t`，通过后 reload；服务在等待 Nginx 命令时重启也恢复旧链接。恢复失败则阻止后续发布。默认成功结果的 `activation_status` 为 `reload_requested`，表示文件就位且命令成功，不代表检查过 worker 或业务响应。
 
-`nginx -t` 失败返回 HTTP 500、`error_code: NGINX_TEST_FAILED` 和命令输出；reload 失败返回 `NGINX_RELOAD_FAILED`。恢复失败返回 HTTP 503、`RECOVERY_FAILED`，保留原始错误和恢复错误。批量客户端输出这些详情，以退出码 1 结束，Jenkins 的 `sh` 步骤随即失败，后续节点不继续发布。详见 [错误响应与 Jenkins](docs/request-targets.md#错误响应与-jenkins)。
+`nginx -t` 接口失败返回 HTTP 500、`error_code: NGINX_TEST_FAILED` 和命令输出；reload 接口失败返回 `NGINX_RELOAD_FAILED`。恢复失败返回 HTTP 503、`RECOVERY_FAILED`，保留原始错误和恢复错误。批量客户端输出这些详情，以退出码 1 结束，Jenkins 的 `sh` 步骤随即失败，后续节点不继续发布。详见 [错误响应与 Jenkins](docs/request-targets.md#错误响应与-jenkins)。
 
 ## HTTP 接口
 
-四个接口保持不变：
+接口：
 
 | 方法及路径 | 用途 |
 | --- | --- |
 | `GET /healthz` | 协议能力、node_id、publish_ready、busy |
 | `GET /api/v1/releases/state` | 目标当前状态，或按 release_id 查询历史结果 |
-| `POST /api/v1/releases/apply` | 同步发布，或按原成功记录恢复 |
+| `POST /api/v1/releases/apply` | 同步、校验、切换 latest；成功暂挂时返回 HTTP 202 |
+| `POST /api/v1/releases/nginx/test` | 对指定暂挂 release_id 执行 nginx -t；成功后返回 HTTP 202 |
+| `POST /api/v1/releases/nginx/reload` | 对已通过检测的 release_id 执行 reload 与生效验证；成功后返回 HTTP 200 |
 | `GET /metrics` | 有限维度的 Prometheus 指标 |
 
-apply/state 使用 `X-Release-Token`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
+apply、nginx/test、nginx/reload、state 使用 `X-Release-Token`。Nginx 命令接口请求体只包含 `env` 和 `/apply` 响应中的 `release_id`。所有接口受配置的来源 IP 约束。受信反代的 XFF 从右侧逐跳解析，忽略首个不可信节点左侧的伪造地址。
 
 简单发布请求如下，`commitid` 也可作为 `commit_id` 的兼容别名：
 
@@ -142,7 +144,7 @@ curl --get "$RELEASE_URL/api/v1/releases/state" \
 
 同一 release_id、相同规范化参数会重放记录；同一 ID 参数变化返回 409。运行中返回 409，待恢复返回 503。状态修订号冲突也返回 409，防止覆盖后续发布，包括 A→B→A 的情况。
 
-响应保留逐步耗时、`status`、`activation_status`、`rollback_status`、前后修订号及错误码。成功或跳过为 200，已接收发布执行失败为 500，状态不确定或恢复失败为 503。HTTP 超时不是失败结论，查询：
+响应保留逐步耗时、`status`、`activation_status`、`rollback_status`、前后修订号及错误码。切换 latest 后等待 nginx -t、或 nginx -t 成功后等待 reload 时为 HTTP 202；最终成功或跳过为 200，执行失败为 500，状态不确定或恢复失败为 503。HTTP 超时不是失败结论，查询：
 
 ```text
 GET /api/v1/releases/state?env=uat&target_id=<目标 ID>&release_id=<原请求 UUID>

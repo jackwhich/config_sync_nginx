@@ -9,7 +9,7 @@
 | 服务配置 | listen_addr、data_dir、log_file、release_auth_tokens、repos、oras、targets |
 | POST 顶层 | env、type、commit_id，可选 branch、project |
 | POST params | server_name、path_dest（每次发布必填，绝对路径） |
-| 服务自动处理 | 节点主机名、默认发布锁、目标身份和持久状态、调用已有 nginx -t/reload 命令 |
+| 服务自动处理 | 节点主机名、默认发布锁、目标身份和持久状态；Nginx 命令须由发布方按顺序调用专用接口 |
 
 ```yaml
 targets:
@@ -90,13 +90,28 @@ nginx -t
 nginx -s reload
 ```
 
-config、whitelist 和 frontend_static 均在文件校验完成并原子切换 latest 后执行 `nginx -t`，确保检查到候选文件；只有检查通过才执行 `nginx -s reload`。发布失败时恢复本机旧链接，先检查旧配置，通过后再次 reload；不重新拉取 Git 或 Harbor。
+`POST /api/v1/releases/apply` 只负责同步来源、校验候选快照并原子切换 `latest`。成功后返回 HTTP 202，状态为 `running`、阶段为 `awaiting_nginx_test`；此时发布还没有完成，且节点拒绝其他发布。
+
+发布方必须使用同一个 `release_id` 再依次调用以下接口。二者均使用和 apply 相同的 `X-Release-Token`：
+
+```http
+POST /api/v1/releases/nginx/test
+POST /api/v1/releases/nginx/reload
+Content-Type: application/json
+X-Release-Token: <uat 对应的 Token>
+
+{"env":"uat","release_id":"<apply 返回的 release_id>"}
+```
+
+- `nginx/test` 只在 `latest` 已切换且阶段为 `awaiting_nginx_test` 时执行 `nginx -t`。通过后返回 HTTP 202、阶段 `awaiting_nginx_reload`。
+- `nginx/reload` 只接受已通过检测的同一 release，执行 `nginx -s reload`、验证候选快照并提交状态；成功才返回 HTTP 200、`status: succeeded`。
+- 任一命令失败，服务立即恢复本机原来的 `latest`，对旧配置执行 `nginx -t` 和 reload；不重新拉取 Git 或 Harbor。服务在两个命令之间重启，也会按同样的恢复流程处理，而不会把未检测的候选配置保留为已发布版本。
 
 服务配置不再接受 nginx 块。不读取 PID、不扫描进程、不解析启动参数、不检查 master/worker、不发送自行构造的 HUP，不安装、启动或停止 Nginx。已有 Nginx 主配置、include/root 由现有运维方式维护。
 
 服务运行环境的 PATH 应能找到已有 nginx 命令，服务账号应具备配置检查和 reload 所需权限。命令缺失、非零退出或超时都会报告失败；不得只记录日志后返回发布成功。
 
-命令成功时 `activation_status` 为 `reload_requested`，表示文件已切换、`nginx -t` 通过且 reload 命令成功。Nginx reload 是异步处理，默认不宣称新 worker 或业务响应已验证；有明确 URL 时，可选逐站点 HTTP 探测仍可使用。具体站点也不再要求填写 health_checks 或 public_base_url。
+命令成功时最终 `activation_status` 为 `reload_requested`，表示文件已切换、`nginx -t` 通过且 reload 命令成功。Nginx reload 是异步处理，默认不宣称新 worker 或业务响应已验证；有明确 URL 时，可选逐站点 HTTP 探测仍可使用。具体站点也不再要求填写 health_checks 或 public_base_url。
 
 ## 幂等、并发和恢复
 
@@ -114,13 +129,13 @@ restore_of 撤销批次仍要求 expected_state_revision，以确认没有其他
 ./bin/nginx_updata_config -config configs/service.example.yaml -check-config
 ```
 
-此命令只校验配置，不创建日志、状态或部署目录，也不连接 Git/Harbor、不探测 Nginx。服务启动不依赖读取 Nginx 进程；发布时检查仓库连接、执行 `nginx -t`，通过后执行 reload。
+此命令只校验配置，不创建日志、状态或部署目录，也不连接 Git/Harbor、不探测 Nginx。服务启动不依赖读取 Nginx 进程；发布时由发布方在 apply 返回后依次调用 Nginx 检测和 reload 接口。
 
 兼容类型列表并不意味着可以直接接管旧 Agent 状态。已有 HTTP v2 状态的 node_id/data_dir/lock_file 应保持不变；从具体站点改为类型列表时，现有目标会从持久状态加载。较早的 Agent 状态和未管理目录仍需迁移。类型列表模式先通过 GET state 携带站点参数登记目标，再停服务执行 -adopt-target 离线导入；前端 ORAS 仍使用新空目标完成切换。
 
 ## 错误响应与 Jenkins
 
-`nginx -t` 失败后不 reload 候选配置。服务先恢复旧链接、检查旧配置并 reload，再返回 HTTP 500；即使恢复成功，本次发布仍是失败。响应示例（省略其他事务字段）：
+`nginx -t` 失败后不 reload 候选配置。服务先恢复旧链接、检查旧配置并 reload，再由 `/api/v1/releases/nginx/test` 返回 HTTP 500；即使恢复成功，本次发布仍是失败。响应示例（省略其他事务字段）：
 
 ```json
 {
@@ -137,6 +152,6 @@ restore_of 撤销批次仍要求 expected_state_revision，以确认没有其他
 
 reload 失败的错误码为 `NGINX_RELOAD_FAILED`。若旧配置检查或恢复 reload 也失败，返回 HTTP 503、`status: recovery_required`、`error_code: RECOVERY_FAILED`；error 同时保留原始失败和恢复失败详情，目标禁止继续发布。
 
-`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 只发布 config/whitelist：先显式检出配置的 GitLab 制品仓库，再用 curl 直连节点；任一节点非 200 即失败并打印响应体。自行用 curl 调用时同样要保留错误响应并以非零码结束，避免把 HTTP 500 当成脚本成功。
+`scripts/release_http.py` 将 error_code 和 error 输出到控制台，并保存到批次 JSON。它会对每台节点依次发出 apply、nginx/test、nginx/reload 请求。任一节点失败即停止后续发布，客户端退出码为 1；选择 restore 策略时只恢复已成功节点，仍以非零码结束。[Jenkinsfile](../Jenkinsfile) 只发布 config/whitelist：先显式检出配置的 GitLab 制品仓库，再用 curl 直连节点，依次期待 HTTP 202、202、200。任一步未返回预期状态即打印响应体并失败，避免把 HTTP 500 当成脚本成功。
 
 配置/白名单 Jenkins 参数与 HTTP 字段映射见 [Jenkins 发布说明](jenkins.md)。

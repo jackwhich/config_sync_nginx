@@ -147,6 +147,39 @@ def identity(http, node, env):
         raise ReleaseError("endpoint identity or contract changed: " + node["url"])
 
 
+def activate_pending(http, batch, node, path, request, result, result_key):
+    """Advance a staged release through its explicit nginx command endpoints."""
+    while result.get("status") == "running":
+        phase = result.get("phase")
+        if phase == "awaiting_nginx_test":
+            endpoint, expected_phase, label = "/api/v1/releases/nginx/test", "awaiting_nginx_reload", "nginx_test"
+        elif phase == "awaiting_nginx_reload":
+            endpoint, expected_phase, label = "/api/v1/releases/nginx/reload", None, "nginx_reload"
+        else:
+            raise ReleaseError("node returned an unknown pending release phase: " + str(phase))
+        node[result_key] = result
+        node["phase"] = label + "_sending"
+        atomic_save(path, batch)
+        try:
+            code, response = http.call(node["url"], endpoint, {"env": request["env"], "release_id": request["release_id"]})
+        except ReleaseError:
+            node["phase"] = "unknown"
+            atomic_save(path, batch)
+            raise
+        if response.get("release_id") not in {None, request["release_id"]}:
+            raise ReleaseError("nginx command response release identity mismatch")
+        node[result_key] = response
+        node["phase"] = label + "_complete"
+        atomic_save(path, batch)
+        if response.get("status") == "running":
+            if code != 202 or response.get("phase") != expected_phase:
+                raise ReleaseError("unexpected pending nginx command response: HTTP %s: %s" % (code, failure_detail(response)))
+        elif response.get("status") not in TERMINAL and response.get("status") != "recovery_required":
+            raise ReleaseError("unexpected nginx command response: HTTP %s: %s" % (code, failure_detail(response)))
+        result = response
+    return result
+
+
 def execute_node(http, batch, node, path, key="request", result_key="result", resolve_timeout=120):
     request = node[key]
     result = node.get(result_key)
@@ -167,6 +200,13 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
                 node["phase"] = result_key + "_complete"
                 atomic_save(path, batch)
                 return result
+            if result.get("status") == "running":
+                result = activate_pending(http, batch, node, path, request, result, result_key)
+                if result.get("status") in TERMINAL:
+                    node[result_key] = result
+                    node["phase"] = result_key + "_complete"
+                    atomic_save(path, batch)
+                    return result
             if result.get("status") == "recovery_required":
                 node[result_key] = result
                 node["phase"] = "recovery_required"
@@ -185,6 +225,15 @@ def execute_node(http, batch, node, path, key="request", result_key="result", re
             else:
                 if response.get("release_id") not in {None, request["release_id"]}:
                     raise ReleaseError("POST response release identity mismatch")
+                if response.get("status") == "running":
+                    if status != 202 or response.get("phase") != "awaiting_nginx_test":
+                        raise ReleaseError("unexpected staged release response: HTTP %s: %s" % (status, failure_detail(response)))
+                    result = activate_pending(http, batch, node, path, request, response, result_key)
+                    if result.get("status") in TERMINAL:
+                        node[result_key] = result
+                        node["phase"] = result_key + "_complete"
+                        atomic_save(path, batch)
+                        return result
                 # A terminal response is trusted only when tied to an accepted record.
                 if response.get("status") in TERMINAL and response.get("state_revision_before"):
                     node[result_key] = response

@@ -23,10 +23,10 @@ Job 可以使用 Pipeline from SCM 读取本仓库的 `Jenkinsfile`；流水线�
 | `RELEASE_BRANCH`（默认 uat） | 顶层 branch |
 | environment 固定值 | env、project、path_dest、节点 URL、GitLab 地址及凭据 ID |
 
-每个节点先 `GET /healthz`，确认 `release_contract` 为 2 且 `publish_ready` 为 true，再 `POST /api/v1/releases/apply`。任一节点非 200 即停止后续节点。
+每个节点先 `GET /healthz`，确认 `release_contract` 为 2 且 `publish_ready` 为 true，再按顺序调用：`POST /api/v1/releases/apply`（预期 HTTP 202）、`POST /api/v1/releases/nginx/test`（预期 HTTP 202）、`POST /api/v1/releases/nginx/reload`（预期 HTTP 200）。后两个接口只提交 `env` 和 apply 响应中的 `release_id`。任一步失败即停止后续节点；节点服务会恢复切换前的 latest。
 
 Git 仓库位置不作为 Jenkins 请求参数；服务按 type 选择 repos.config 或 repos.whitelist。
 
 ## 失败处理
 
-检查/reload 错误在 HTTP 响应体里，控制台会打印。配置/白名单失败后修复 GitLab 提交，再跑一次 update。前端发布、摘要固定和回滚均不走本 Job。
+Git 获取、latest 切换、nginx -t、reload、生效验证及恢复结果都会按 node_id 输出到控制台。配置/白名单失败后修复 GitLab 提交，再跑一次 update；若响应为 recovery_required，先恢复对应节点。前端发布、摘要固定和回滚均不走本 Job。

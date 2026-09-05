@@ -207,6 +207,12 @@ func (r *Runner) Health() map[string]any {
 				reason = "target requires recovery or explicit baseline migration"
 			}
 		}
+		if st.ActiveID != "" {
+			ready = false
+			if reason == "" {
+				reason = "release awaits nginx activation"
+			}
+		}
 	}
 	prom.Ready(r.cfg.Env, r.cfg.NodeID, ready)
 	envs := []string{}
@@ -391,7 +397,21 @@ func (r *Runner) duplicate(req release.ApplyRequest, fingerprint string) (releas
 	}
 	return release.Result{}, false
 }
+
+// Apply retains the in-process synchronous workflow for callers that use the
+// Go API directly. HTTP callers use Stage followed by the separate nginx
+// command endpoints.
 func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Result {
+	return r.apply(ctx, req, false)
+}
+
+// Stage fetches and verifies a candidate, then switches latest. It leaves the
+// release active until NginxTest and NginxReload have completed.
+func (r *Runner) Stage(ctx context.Context, req release.ApplyRequest) release.Result {
+	return r.apply(ctx, req, true)
+}
+
+func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginxCommands bool) release.Result {
 	if e := release.ValidateApplyRequest(&req); e != nil {
 		return reject(req, 400, "INVALID_REQUEST", e.Error())
 	}
@@ -609,6 +629,12 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		}
 		return fsutil.Switch(base, rec.Candidate.Link)
 	})
+	if e != nil {
+		return r.restore(t, st, rec, "ACTIVATION_FAILED", e)
+	}
+	if deferNginxCommands {
+		return r.awaitNginxCommand(st, rec, "awaiting_nginx_test", "latest_switched")
+	}
 	if e == nil {
 		e = r.stepWithOutput(critical, st, rec, "nginx_test", r.nginxTest)
 		if e != nil {
@@ -717,6 +743,141 @@ func commandOutput(output string, err error) string {
 	}
 	return output
 }
+
+func (r *Runner) awaitNginxCommand(st *state.TargetState, rec *state.Record, phase, activation string) release.Result {
+	rec.Result.Status = release.NodeStatusRunning
+	rec.Result.Phase = phase
+	rec.Result.ActivationStatus = activation
+	rec.Result.RollbackStatus = "not_needed"
+	rec.HTTPStatus = http.StatusAccepted
+	if e := r.save(st); e != nil {
+		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
+	}
+	return r.result(rec)
+}
+
+func nginxCommandReject(req release.NginxCommandRequest, code int, key, message string) release.Result {
+	return release.Result{ReleaseID: req.ReleaseID, Env: req.Env, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: message, HTTPStatus: code, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
+}
+
+// NginxTest runs nginx -t only for the active release that has already
+// switched latest through Stage. A failure restores the recorded baseline.
+func (r *Runner) NginxTest(ctx context.Context, req release.NginxCommandRequest) release.Result {
+	return r.runNginxCommand(ctx, req, "test")
+}
+
+// NginxReload runs nginx -s reload only after a successful NginxTest. It
+// verifies the activated configuration and commits the release on success.
+func (r *Runner) NginxReload(ctx context.Context, req release.NginxCommandRequest) release.Result {
+	return r.runNginxCommand(ctx, req, "reload")
+}
+
+func (r *Runner) runNginxCommand(ctx context.Context, req release.NginxCommandRequest, command string) release.Result {
+	if e := release.ValidateNginxCommandRequest(&req); e != nil {
+		return nginxCommandReject(req, http.StatusBadRequest, "INVALID_REQUEST", e.Error())
+	}
+	if !r.cfg.AcceptsEnv(req.Env) {
+		return nginxCommandReject(req, http.StatusForbidden, "ENV_NOT_ALLOWED", "environment does not match this node")
+	}
+	select {
+	case r.busy <- struct{}{}:
+		defer func() { <-r.busy }()
+	default:
+		return nginxCommandReject(req, http.StatusConflict, "NODE_BUSY", "another release owns the node lock")
+	}
+	if e := r.nodeLock.Try(); e != nil {
+		if errors.Is(e, lock.ErrBusy) {
+			return nginxCommandReject(req, http.StatusConflict, "NODE_BUSY", e.Error())
+		}
+		return nginxCommandReject(req, http.StatusServiceUnavailable, "LOCK_FAILED", e.Error())
+	}
+	defer r.nodeLock.Unlock()
+	if e := r.load(); e != nil {
+		r.block(e.Error())
+		return nginxCommandReject(req, http.StatusServiceUnavailable, "STATE_UNAVAILABLE", e.Error())
+	}
+	r.mu.RLock()
+	blocked, stopping := r.blocked, r.stopping
+	r.mu.RUnlock()
+	if blocked != "" || stopping {
+		return nginxCommandReject(req, http.StatusServiceUnavailable, "RECOVERY_REQUIRED", "publication unavailable: "+blocked)
+	}
+
+	var targetID string
+	r.mu.RLock()
+	for id, view := range r.views {
+		if view.Records[req.ReleaseID] != nil {
+			targetID = id
+			break
+		}
+	}
+	r.mu.RUnlock()
+	if targetID == "" {
+		return nginxCommandReject(req, http.StatusNotFound, "RELEASE_NOT_FOUND", "release_id not found")
+	}
+	st, e := r.store.Load(targetID)
+	if e != nil {
+		return nginxCommandReject(req, http.StatusServiceUnavailable, "STATE_UNAVAILABLE", e.Error())
+	}
+	rec := st.Records[req.ReleaseID]
+	if rec == nil || st.ActiveID != req.ReleaseID || !rec.Intent || rec.Candidate == nil {
+		return nginxCommandReject(req, http.StatusConflict, "RELEASE_NOT_PENDING", "release is not awaiting an nginx command")
+	}
+	env := st.Target.Env
+	if env == "" {
+		env = r.cfg.Env
+	}
+	if env != req.Env || rec.Request.Env != req.Env {
+		return nginxCommandReject(req, http.StatusForbidden, "ENV_NOT_ALLOWED", "release environment does not match this node")
+	}
+	target, ok := r.Target(targetID)
+	if !ok {
+		return nginxCommandReject(req, http.StatusForbidden, "TARGET_NOT_ALLOWED", "release target is no longer authorized")
+	}
+	base, e := openTarget(target)
+	if e != nil {
+		return r.uncertain(st, rec, "TARGET_UNAVAILABLE", e)
+	}
+	defer base.Close()
+	if link, e := fsutil.Link(base); e != nil || link != rec.Candidate.Link {
+		if e == nil {
+			e = fmt.Errorf("latest changed before nginx command")
+		}
+		return r.uncertain(st, rec, "BASELINE_UNVERIFIED", e)
+	}
+	deadline, cancel := context.WithTimeout(ctx, r.cfg.ExecutionTimeout.Value())
+	defer cancel()
+	switch command {
+	case "test":
+		if rec.Result.Phase != "awaiting_nginx_test" {
+			return nginxCommandReject(req, http.StatusConflict, "NGINX_TEST_NOT_PENDING", "release is not awaiting nginx -t")
+		}
+		if e = r.stepWithOutput(deadline, st, rec, "nginx_test", r.nginxTest); e != nil {
+			return r.restore(target, st, rec, "NGINX_TEST_FAILED", e)
+		}
+		rec.NginxTested = true
+		return r.awaitNginxCommand(st, rec, "awaiting_nginx_reload", "nginx_test_passed")
+	case "reload":
+		if rec.Result.Phase != "awaiting_nginx_reload" || !rec.NginxTested {
+			return nginxCommandReject(req, http.StatusConflict, "NGINX_RELOAD_NOT_PENDING", "release requires a successful nginx -t before reload")
+		}
+		if e = r.stepWithOutput(deadline, st, rec, "reload", r.nginxReload); e != nil {
+			return r.restore(target, st, rec, "NGINX_RELOAD_FAILED", e)
+		}
+		if e = r.step(deadline, st, rec, "verify_activation", func(c context.Context) error {
+			if e := r.verify(c, target, base, rec.Candidate); e != nil {
+				return e
+			}
+			return r.verifyRetainedAssets(c, target, base, st, rec)
+		}); e != nil {
+			return r.restore(target, st, rec, "ACTIVATION_FAILED", e)
+		}
+		return r.commit(target, st, rec)
+	default:
+		return nginxCommandReject(req, http.StatusBadRequest, "INVALID_COMMAND", "unsupported nginx command")
+	}
+}
+
 func (r *Runner) verify(ctx context.Context, t config.Target, base *os.Root, v *state.Version) error {
 	commit := ""
 	var m *state.Manifest
@@ -749,6 +910,8 @@ func (r *Runner) result(rec *state.Record) release.Result {
 	if result.Status == release.NodeStatusFailed || result.Status == release.NodeStatusRecoveryRequired {
 		fields["error"] = result.Error
 		applog.LogError("发布执行失败", "release_result", fields)
+	} else if result.Status == release.NodeStatusRunning {
+		applog.LogInfo("发布等待 Nginx 命令", "release_pending", fields)
 	} else {
 		applog.LogInfo("发布执行完成", "release_result", fields)
 	}
@@ -884,6 +1047,10 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 		}
 		st.RecoveryRequired = false
 		r.fail(st, rec, "INTERRUPTED", errorMarker{})
+		return
+	}
+	if rec.Result.Phase == "awaiting_nginx_test" || rec.Result.Phase == "awaiting_nginx_reload" {
+		r.restore(t, st, rec, "INTERRUPTED", fmt.Errorf("service restarted before the pending nginx command"))
 		return
 	}
 	base, e := openTarget(t)

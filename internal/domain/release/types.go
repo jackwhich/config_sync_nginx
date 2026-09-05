@@ -51,6 +51,13 @@ type ApplyRequest struct {
 	Operator              string            `json:"operator,omitempty"`
 	BuildURL              string            `json:"build_url,omitempty"`
 }
+
+// NginxCommandRequest continues a release that has switched latest and is
+// waiting for Jenkins to run nginx -t or nginx -s reload explicitly.
+type NginxCommandRequest struct {
+	ReleaseID string `json:"release_id"`
+	Env       string `json:"env"`
+}
 type Step struct {
 	Name       string     `json:"name"`
 	Status     NodeStatus `json:"status"`

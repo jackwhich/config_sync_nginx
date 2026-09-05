@@ -268,6 +268,112 @@ func TestSuccessfulNginxStepsReportCommands(t *testing.T) {
 	}
 }
 
+func TestStagedNginxCommandsActivateOnlyAfterReload(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	if staged.Status != release.NodeStatusRunning || staged.HTTPStatus != 202 || staged.Phase != "awaiting_nginx_test" {
+		t.Fatal(staged)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || st.ActiveID != staged.ReleaseID || link != b {
+		t.Fatalf("stage state = %+v link=%q", st, link)
+	}
+	command := release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID}
+	tested := f.r.NginxTest(context.Background(), command)
+	if tested.Status != release.NodeStatusRunning || tested.HTTPStatus != 202 || tested.Phase != "awaiting_nginx_reload" {
+		t.Fatal(tested)
+	}
+	st, link = f.current()
+	if st.Current.CommitID != a || st.ActiveID != staged.ReleaseID || link != b {
+		t.Fatalf("test state = %+v link=%q", st, link)
+	}
+	activated := f.r.NginxReload(context.Background(), command)
+	if activated.Status != release.NodeStatusSucceeded || activated.HTTPStatus != 200 {
+		t.Fatal(activated)
+	}
+	st, link = f.current()
+	if st.Current.CommitID != b || st.ActiveID != "" || link != b {
+		t.Fatalf("activated state = %+v link=%q", st, link)
+	}
+}
+
+func TestStagedNginxTestFailureRestoresBaseline(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	if staged.Status != release.NodeStatusRunning {
+		t.Fatal(staged)
+	}
+	calls := 0
+	f.rt.test = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return errors.New("candidate nginx -t failed")
+		}
+		return nil
+	}
+	failed := f.r.NginxTest(context.Background(), release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID})
+	if failed.Status != release.NodeStatusFailed || failed.ErrorCode != "NGINX_TEST_FAILED" || failed.RollbackStatus != "succeeded" {
+		t.Fatal(failed)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || st.ActiveID != "" || link != a {
+		t.Fatalf("restored state = %+v link=%q", st, link)
+	}
+}
+
+func TestStagedNginxReloadFailureRestoresBaseline(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	command := release.NginxCommandRequest{Env: "test", ReleaseID: staged.ReleaseID}
+	if tested := f.r.NginxTest(context.Background(), command); tested.Status != release.NodeStatusRunning {
+		t.Fatal(tested)
+	}
+	calls := 0
+	f.rt.reload = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return errors.New("candidate reload failed")
+		}
+		return nil
+	}
+	failed := f.r.NginxReload(context.Background(), command)
+	if failed.Status != release.NodeStatusFailed || failed.ErrorCode != "NGINX_RELOAD_FAILED" || failed.RollbackStatus != "succeeded" {
+		t.Fatal(failed)
+	}
+	st, link := f.current()
+	if st.Current.CommitID != a || st.ActiveID != "" || link != a {
+		t.Fatalf("restored state = %+v link=%q", st, link)
+	}
+}
+
+func TestRestartWhileAwaitingNginxCommandRestoresBaseline(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	staged := f.r.Stage(context.Background(), f.request(b))
+	if staged.Status != release.NodeStatusRunning || staged.Phase != "awaiting_nginx_test" {
+		t.Fatal(staged)
+	}
+	f.restart()
+	st, link := f.current()
+	if st.Current.CommitID != a || st.ActiveID != "" || st.RecoveryRequired || link != a {
+		t.Fatalf("restart did not restore baseline: %+v link=%q", st, link)
+	}
+	if got := st.Records[staged.ReleaseID].Result; got.Status != release.NodeStatusFailed || got.ErrorCode != "INTERRUPTED" || got.RollbackStatus != "succeeded" {
+		t.Fatalf("pending release result = %+v", got)
+	}
+}
+
 func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")

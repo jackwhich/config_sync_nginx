@@ -19,6 +19,19 @@ var sitePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 func IsID(v string) bool     { return uuidPattern.MatchString(v) }
 func IsCommit(v string) bool { return commitPattern.MatchString(v) }
+
+func ValidateNginxCommandRequest(r *NginxCommandRequest) error {
+	r.ReleaseID = strings.TrimSpace(r.ReleaseID)
+	r.Env = strings.TrimSpace(r.Env)
+	if !IsID(r.ReleaseID) {
+		return fieldError("release_id", "须为 UUID")
+	}
+	if r.Env == "" || len(r.Env) > 64 {
+		return fieldError("env", "不能为空或超长")
+	}
+	return nil
+}
+
 func ValidateApplyRequest(r *ApplyRequest) error {
 	if r.Params == nil {
 		r.Params = map[string]string{}

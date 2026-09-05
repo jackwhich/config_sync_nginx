@@ -27,6 +27,13 @@ type resultPublisher struct {
 }
 
 func (p resultPublisher) Apply(context.Context, release.ApplyRequest) release.Result { return p.result }
+func (p resultPublisher) Stage(context.Context, release.ApplyRequest) release.Result { return p.result }
+func (p resultPublisher) NginxTest(context.Context, release.NginxCommandRequest) release.Result {
+	return p.result
+}
+func (p resultPublisher) NginxReload(context.Context, release.NginxCommandRequest) release.Result {
+	return p.result
+}
 
 func TestNginxErrorsReachHTTPClient(t *testing.T) {
 	diagnostic := "nginx -t: nginx failed: exit status 1: nginx: [emerg] unknown directive in site.conf:7"

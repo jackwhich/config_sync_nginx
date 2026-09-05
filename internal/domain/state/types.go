@@ -38,6 +38,7 @@ type Record struct {
 	BeforeLink       string               `json:"before_link"`
 	Candidate        *Version             `json:"candidate,omitempty"`
 	Intent           bool                 `json:"switch_intent"`
+	NginxTested      bool                 `json:"nginx_tested"`
 }
 type TargetState struct {
 	Schema           int                `json:"schema"`

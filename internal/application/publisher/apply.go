@@ -194,18 +194,34 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, e
 	}
 	defer src.Close()
-	// Git export contains only the requested server_name directory. Preserve
-	// that directory inside config/whitelist snapshots: the deployment root is
-	// already named after server_name, so the Git data intentionally forms the
-	// second server_name layer below the version hash. Frontend artifacts keep
-	// their existing flat layout for Nginx root compatibility.
+	// Preserve the Git server_name directory inside config/whitelist snapshots.
+	// Git archive has differed across older client versions: some exports retain
+	// the requested directory and some flatten it. Normalize both forms so the
+	// deployment layout is always <hash>/<server_name>/... . Frontend artifacts
+	// keep their existing flat layout for Nginx root compatibility.
 	sourceRoot := src
+	outputPrefix := ""
 	if t.Type == release.ReleaseTypeFrontendStatic {
 		sourceRoot, e = src.OpenRoot(t.ServerName)
 		if e != nil {
 			return nil, e
 		}
 		defer sourceRoot.Close()
+	} else {
+		outputPrefix = t.ServerName
+		info, err := src.Lstat(t.ServerName)
+		if err == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("Git server directory is not a real directory: %s", t.ServerName)
+			}
+			sourceRoot, e = src.OpenRoot(t.ServerName)
+			if e != nil {
+				return nil, e
+			}
+			defer sourceRoot.Close()
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 	}
 	stage := ".staging/stage-" + release.ID()
 	if e = base.Mkdir(stage, 0755); e != nil {
@@ -234,13 +250,17 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if name == "." {
 			return nil
 		}
+		outputName := name
+		if outputPrefix != "" {
+			outputName = path.Join(outputPrefix, name)
+		}
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symlinks prohibited")
 		}
 		if d.IsDir() {
-			return fsutil.EnsureDirs(dst, name, 0755)
+			return fsutil.EnsureDirs(dst, outputName, 0755)
 		}
-		if name == ".release-version" {
+		if outputName == ".release-version" {
 			return fmt.Errorf("reserved .release-version file")
 		}
 		if t.Type == release.ReleaseTypeFrontendStatic && t.SharedAssets && name == "frontend-manifest.json" {
@@ -258,10 +278,10 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if err = ensureSpace(base, c.MinFreeBytes+uint64(f.Size)); err != nil {
 			return err
 		}
-		if err = fsutil.CopyFile(ctx, sourceRoot, dst, name, name, t.Mode()); err != nil {
+		if err = fsutil.CopyFile(ctx, sourceRoot, dst, name, outputName, t.Mode()); err != nil {
 			return err
 		}
-		m.Files[name] = f
+		m.Files[outputName] = f
 		return nil
 	})
 	if e != nil {

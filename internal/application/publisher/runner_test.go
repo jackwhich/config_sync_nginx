@@ -229,6 +229,29 @@ func TestLegacyBaselineLinkMigratesToDirectSnapshot(t *testing.T) {
 		t.Fatalf("unexpected migrated baseline: %+v, %q", st.Current, link)
 	}
 }
+
+func TestGitSnapshotAddsServerNameForFlattenedExport(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "site.conf"), []byte("server {}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pathDest, err := fsutil.Canonical(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := config.Target{Type: release.ReleaseTypeConfig, ServerName: "site", PathDest: pathDest, FileMode: "0644"}
+	commit := strings.Repeat("a", 40)
+	version, err := prepareSnapshot(context.Background(), config.Config{MaxArchiveBytes: 1 << 20, MaxArchiveFiles: 10}, target, work, commit, "file:///repo", commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.Link != commit {
+		t.Fatalf("snapshot link = %q", version.Link)
+	}
+	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site", "site.conf")); err != nil {
+		t.Fatalf("flattened Git export was not placed below server_name: %v", err)
+	}
+}
 func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")

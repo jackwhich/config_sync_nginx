@@ -1,5 +1,5 @@
 // HTTP 发布流水线。Jenkins 的 agent 只指定构建执行器，节点部署用 curl 直连 HTTP。
-// 本 Job 只发布 config / whitelist；前端制品请使用独立的 Jenkinsfile。
+// 本 Job 只发布 config；白名单和前端制品请使用各自独立的 Jenkinsfile。
 // 发布提交来自下方配置的 GitLab 仓库，而不是 Jenkinsfile 所在仓库。
 def jsonLogField(text, field) {
   def found = text =~ /"${field}"\s*:\s*"([^"]*)"/
@@ -54,14 +54,14 @@ pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds(); skipDefaultCheckout() }
   parameters {
-    choice(name: 'ACTION', choices: ['update'], description: '配置/白名单发布')
-    choice(name: 'RELEASE_TYPE', choices: ['config', 'whitelist'], description: '发布类型；不支持 frontend_static')
+    choice(name: 'ACTION', choices: ['update'], description: '配置发布操作')
     choice(name: 'SERVER_NAME', choices: ['ybf-uat-nginx', 'jp-ybf-uat-nginx'], description: '配置中允许的站点')
   }
   environment {
     RELEASE_ENV = 'uat'
     RELEASE_BRANCH = 'uat'
     RELEASE_PROJECT = 'ybf'
+    RELEASE_TYPE = 'config'
     RELEASE_PATH_DEST = '/data/nginx-publish'
     // GitLab 制品仓库及其 Jenkins Username/Password 或 SSH 私钥凭据。
     RELEASE_SOURCE_REPOSITORY_URL = 'https://dcproopsgitlab.opscom999.com/dc-ops/nginx_vhost.git'
@@ -89,11 +89,10 @@ pipeline {
       steps {
         script {
           if (!isUnix()) { error('发布执行器需要 curl，请使用 Linux 执行器') }
-          env.RELEASE_TYPE = params.RELEASE_TYPE
           env.RELEASE_SERVER_NAME = params.SERVER_NAME
           env.RELEASE_URLS = env["SERVICE_URLS_${params.SERVER_NAME.replace('-', '_')}"]
           env.RELEASE_COMMIT = sh(script: 'git rev-parse HEAD', returnStdout: true).trim().toLowerCase()
-          if (!(env.RELEASE_TYPE in ['config', 'whitelist'])) { error('RELEASE_TYPE 只能为 config 或 whitelist') }
+          if (env.RELEASE_TYPE != 'config') { error('本 Job 仅支持 RELEASE_TYPE=config') }
           if (!(env.RELEASE_COMMIT ==~ /(?:[a-f0-9]{40}|[a-f0-9]{64})/)) {
             error('GitLab 制品仓库当前提交必须是完整 SHA')
           }

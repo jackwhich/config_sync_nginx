@@ -172,7 +172,7 @@ bash scripts/release-apply.sh rollback --batch-file release-batch-001.json
 
 默认失败策略为 `stop`，可在新批次开始前指定 `--failure-policy restore`。后者要求每台节点已有可恢复快照；首次部署使用 stop 并事先确定人工退出策略。未知结果未确认之前不启动任何恢复。恢复失败或基线变化会停止处理，保留记录供排查。
 
-保存批次文件到持久存储，文件内没有令牌。[Jenkinsfile](Jenkinsfile) 只用于 config/whitelist，显式检出其中配置的 GitLab 制品仓库，再以该仓库的 HEAD 发布；构建参数只暴露 ACTION、RELEASE_TYPE 和 SERVER_NAME。它用 curl 直连节点 HTTP，不调用批量脚本。GitLab 检出凭据与节点 Token 分别配置；前端发布和回滚使用独立 Jenkinsfile。详见 [Jenkins 发布说明](docs/jenkins.md)。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
+保存批次文件到持久存储，文件内没有令牌。[Jenkinsfile](Jenkinsfile) 固定用于 config，显式检出其中配置的 GitLab 制品仓库，再以该仓库的 HEAD 发布；构建参数只暴露 ACTION 和 SERVER_NAME，`RELEASE_TYPE=config` 写在环境变量中。它用 curl 直连节点 HTTP，不调用批量脚本。白名单、前端发布和回滚使用独立 Jenkinsfile。GitLab 检出凭据与节点 Token 分别配置；详见 [Jenkins 发布说明](docs/jenkins.md)。Jenkinsfile 中 `agent any` 是 Jenkins 执行器语法，部署方式仍为 HTTP。
 
 ## 前端 ORAS 制品发布
 

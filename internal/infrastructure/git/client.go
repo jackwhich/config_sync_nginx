@@ -77,9 +77,7 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	if branch == "" {
 		refspec = "+refs/heads/*:refs/heads/*"
 	}
-	// Git servers without partial-clone support ignore the filter and perform
-	// a normal fetch, preserving compatibility with older GitLab instances.
-	if _, err = run("--git-dir="+repoDir, "fetch", "--filter=blob:none", "--prune", "--force", "--no-tags", "origin", refspec); err != nil {
+	if err = fetchBranch(run, repoDir, refspec); err != nil {
 		return "", "", err
 	}
 	kind, err := run("--git-dir="+repoDir, "cat-file", "-t", commit)
@@ -126,10 +124,41 @@ func (c Client) Checkout(ctx context.Context, key, branch, commit, site string) 
 	}
 	return dest, actual, nil
 }
+
+func fetchBranch(run func(...string) (string, error), repoDir, refspec string) error {
+	base := []string{"--git-dir=" + repoDir, "fetch", "--prune", "--force", "--no-tags", "origin", refspec}
+	filtered := append([]string{base[0], base[1], "--filter=blob:none"}, base[2:]...)
+	output, err := run(filtered...)
+	if err == nil {
+		return nil
+	}
+	// Some release nodes still use a Git client from before partial clone.
+	// Retry only that known incompatibility; network and authentication errors
+	// must remain visible to the caller.
+	if !filterUnsupported(output) {
+		return err
+	}
+	_, err = run(base...)
+	return err
+}
+
+func filterUnsupported(output string) bool {
+	return strings.Contains(output, "unknown option") && strings.Contains(output, "filter=blob:none")
+}
+
 func ensurePartialRemote(run func(...string) (string, error), repoDir, repositoryURL string) error {
 	const remote = "origin"
-	current, err := run("--git-dir="+repoDir, "remote", "get-url", remote)
+	// `git remote get-url` is not available in older Git clients. Reading the
+	// remote URL from config works on those versions as well.
+	current, err := run("--git-dir="+repoDir, "config", "--get", "remote."+remote+".url")
 	if err != nil {
+		remotes, listErr := run("--git-dir="+repoDir, "remote")
+		if listErr != nil {
+			return listErr
+		}
+		if remoteExists(remotes, remote) {
+			return fmt.Errorf("read %s remote URL: %w", remote, err)
+		}
 		if _, err = run("--git-dir="+repoDir, "remote", "add", remote, repositoryURL); err != nil {
 			return err
 		}
@@ -143,6 +172,15 @@ func ensurePartialRemote(run func(...string) (string, error), repoDir, repositor
 	}
 	_, err = run("--git-dir="+repoDir, "config", "remote."+remote+".partialclonefilter", "blob:none")
 	return err
+}
+
+func remoteExists(remotes, name string) bool {
+	for _, remote := range strings.Fields(remotes) {
+		if remote == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Client) extract(ctx context.Context, repoDir, commit, site, dest string, env, secrets []string) error {

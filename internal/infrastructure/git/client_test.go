@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,4 +128,42 @@ func runGit(t *testing.T, args ...string) string {
 		t.Fatalf("git %v: %v: %s", args, err, b)
 	}
 	return strings.TrimSpace(string(b))
+}
+
+func TestFetchBranchFallsBackWhenFilterIsUnsupported(t *testing.T) {
+	var calls []string
+	run := func(args ...string) (string, error) {
+		call := strings.Join(args, " ")
+		calls = append(calls, call)
+		if strings.Contains(call, "--filter=blob:none") {
+			return "error: unknown option `filter=blob:none`", errors.New("git fetch failed")
+		}
+		return "", nil
+	}
+	if err := fetchBranch(run, "/tmp/repo.git", "+refs/heads/uat:refs/heads/uat"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || !strings.Contains(calls[0], "--filter=blob:none") || strings.Contains(calls[1], "--filter=blob:none") {
+		t.Fatalf("unexpected fetch calls: %v", calls)
+	}
+}
+
+func TestEnsurePartialRemoteUsesConfigURL(t *testing.T) {
+	var calls []string
+	run := func(args ...string) (string, error) {
+		call := strings.Join(args, " ")
+		calls = append(calls, call)
+		if strings.Contains(call, "config --get remote.origin.url") {
+			return "https://gitlab.example.com/ops/repo.git", nil
+		}
+		return "", nil
+	}
+	if err := ensurePartialRemote(run, "/tmp/repo.git", "https://gitlab.example.com/ops/repo.git"); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if strings.Contains(call, "remote get-url") || strings.Contains(call, "remote add") {
+			t.Fatalf("used an incompatible remote command: %s", call)
+		}
+	}
 }

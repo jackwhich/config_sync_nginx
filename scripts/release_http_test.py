@@ -29,6 +29,7 @@ class FakeHTTP:
         self.old_contract = None
         self.capabilities = []
         self.digest_by_node = {"http://a": "sha256:" + "d" * 64, "http://b": "sha256:" + "e" * 64}
+        self.recovery_required = False
         for name, old in (("http://a", "a" * 40), ("http://b", "b" * 40)):
             self.nodes[name] = {"revision": str(uuid.uuid4()), "commit": old, "records": {}, "target": name[-1] * 64}
 
@@ -42,7 +43,7 @@ class FakeHTTP:
             if release_id and self.drop_query:
                 self.drop_query = False
                 raise client.ReleaseError("offline")
-            state = {"node_id": base[-1], "state_revision": node["revision"], "target_id": node["target"], "current_commit_id": node["commit"], "current": {"commit_id": node["commit"]}, "recovery_required": False}
+            state = {"node_id": base[-1], "state_revision": node["revision"], "target_id": node["target"], "current_commit_id": node["commit"], "current": {"commit_id": node["commit"]}, "recovery_required": self.recovery_required}
             if release_id:
                 if release_id not in node["records"]:
                     return 404, {}
@@ -106,6 +107,13 @@ class BatchTests(unittest.TestCase):
         self.http.old_contract = "http://b"
         with self.assertRaises(client.ReleaseError):
             batch(self.http)
+        self.assertEqual(self.http.calls, [])
+
+    def test_stale_recovery_flag_does_not_block_preflight(self):
+        self.http.recovery_required = True
+        request = {"env": "test", "type": "config", "branch": "main", "commit_id": "c" * 40, "params": {"server_name": "site", "path_dest": "/publish"}}
+        nodes = client.preflight(self.http, ["http://a", "http://b"], request)
+        self.assertEqual(len(nodes), 2)
         self.assertEqual(self.http.calls, [])
 
     def test_response_lost_resolves_same_id_without_second_publish(self):

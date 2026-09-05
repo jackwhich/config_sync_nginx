@@ -364,6 +364,24 @@ func (r *Runner) State(id, releaseID string) (map[string]any, int, error) {
 func reject(req release.ApplyRequest, code int, key, msg string) release.Result {
 	return release.Result{ReleaseID: req.ReleaseID, Status: release.NodeStatusFailed, ActivationStatus: "unchanged", RollbackStatus: "not_needed", ErrorCode: key, Error: msg, HTTPStatus: code, StartedAt: time.Now().UTC()}
 }
+
+// takeover lets a new publication own the target. RecoveryRequired is a stored
+// outcome of leftover work, not a node lock, so a later request must be able to
+// close that work out and proceed without restarting the process.
+func (r *Runner) takeover(st *state.TargetState, incoming string) {
+	if id := st.ActiveID; id != "" && id != incoming {
+		if rec := st.Records[id]; rec != nil && !rec.Result.Terminal() {
+			rec.Result.Status = release.NodeStatusFailed
+			rec.Result.ErrorCode = "SUPERSEDED"
+			rec.Result.Error = "superseded by a newer publication"
+			rec.Result.FinishedAt = time.Now().UTC()
+			rec.HTTPStatus = http.StatusConflict
+			applog.LogWarn("新发布接管未完成的旧任务", "release_superseded", map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "target_id": st.Target.ID, "release_id": id, "incoming_release_id": incoming})
+		}
+	}
+	st.ActiveID = ""
+	st.RecoveryRequired = false
+}
 func (r *Runner) duplicate(req release.ApplyRequest, fingerprint string) (release.Result, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -459,11 +477,6 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 	r.mu.RLock()
 	blocked := r.blocked
 	stopping := r.stopping
-	for _, s := range r.views {
-		if s.RecoveryRequired {
-			blocked = "node has unfinished work; restart for recovery"
-		}
-	}
 	r.mu.RUnlock()
 	if blocked != "" || stopping {
 		return reject(req, 503, "RECOVERY_REQUIRED", "publication unavailable: "+blocked)
@@ -487,6 +500,7 @@ func (r *Runner) apply(ctx context.Context, req release.ApplyRequest, deferNginx
 	if req.RestoreOf != "" && req.Type == release.ReleaseTypeFrontendStatic && st.Records[req.RestoreOf].Baseline.ArtifactDigest != req.ArtifactDigest {
 		return reject(req, 409, "RESTORE_BASELINE_CONFLICT", "artifact digest must match the recorded local baseline")
 	}
+	r.takeover(st, req.ReleaseID)
 	prom.Active(t.Env, string(t.Type), t.ID, true)
 	defer prom.Active(t.Env, string(t.Type), t.ID, false)
 	rec := &state.Record{Request: req, Fingerprint: fingerprint, Baseline: st.Current, BaselinePrevious: st.Previous, HTTPStatus: 409}
@@ -980,6 +994,7 @@ func (r *Runner) fail(st *state.TargetState, rec *state.Record, key string, caus
 	rec.Result.FinishedAt = time.Now().UTC()
 	rec.HTTPStatus = http.StatusInternalServerError
 	st.ActiveID = ""
+	st.RecoveryRequired = false
 	if e := r.save(st); e != nil {
 		return r.uncertain(st, rec, "STATE_PERSIST_FAILED", e)
 	}

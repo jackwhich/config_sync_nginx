@@ -131,8 +131,8 @@ def preflight(http, urls, request):
             raise ReleaseError("duplicate/missing node_id or environment mismatch: " + url)
         seen.add(node_id)
         baseline = require(*http.call(url, state_path(request["env"], request=request)))
-        if baseline.get("recovery_required") or baseline.get("node_id") != node_id:
-            raise ReleaseError("node has unresolved state: " + url)
+        if baseline.get("node_id") != node_id:
+            raise ReleaseError("node identity mismatch: " + url)
         if not baseline.get("state_revision") or not baseline.get("target_id"):
             raise ReleaseError("missing contract-2 state fields: " + url)
         req = dict(request, release_id=str(uuid.uuid4()), expected_state_revision=baseline["state_revision"])

@@ -507,7 +507,7 @@ func TestDisconnectedClientCannotCancelCriticalWorkAndNodeLock(t *testing.T) {
 		t.Fatalf("disconnect interrupted activation: %+v", got)
 	}
 }
-func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
+func TestRecoveryFailureDoesNotBlockNewPublication(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")
 	f.apply(a)
@@ -521,8 +521,31 @@ func TestRecoveryFailureBlocksAndStartupRecovers(t *testing.T) {
 	if f.r.Health()["publish_ready"] != true {
 		t.Fatal("a stored release outcome changed service health")
 	}
-	if got = f.r.Apply(context.Background(), f.request(b)); got.HTTPStatus != 503 {
-		t.Fatalf("new work accepted: %+v", got)
+	f.rt.reload = nil
+	retry := f.r.Apply(context.Background(), f.request(b))
+	if retry.Status != release.NodeStatusSucceeded {
+		t.Fatalf("new work rejected: %+v", retry)
+	}
+	st, link := f.current()
+	if st.ActiveID != "" || st.RecoveryRequired || st.Current.CommitID != b || link != b {
+		t.Fatalf("takeover: %+v %s", st, link)
+	}
+	replay := f.r.Apply(context.Background(), req)
+	if !replay.Replayed || replay.Status != release.NodeStatusFailed || replay.ErrorCode != "SUPERSEDED" {
+		t.Fatalf("superseded result: %+v", replay)
+	}
+}
+
+func TestStartupStillRecoversUnfinishedWork(t *testing.T) {
+	f := newFixture(t)
+	a := f.commit("A")
+	f.apply(a)
+	b := f.commit("B")
+	f.rt.reload = func(context.Context) error { return errors.New("nginx unavailable") }
+	req := f.request(b)
+	got := f.r.Apply(context.Background(), req)
+	if got.Status != release.NodeStatusRecoveryRequired || got.HTTPStatus != 503 {
+		t.Fatalf("%+v", got)
 	}
 	f.rt.reload = nil
 	f.restart()

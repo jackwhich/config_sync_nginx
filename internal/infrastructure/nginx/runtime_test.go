@@ -35,3 +35,20 @@ func TestCommandsReportMissingExecutableAndNonzeroExit(t *testing.T) {
 		})
 	}
 }
+
+func TestCommandOutputIsRetained(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", root)
+	if err := os.WriteFile(filepath.Join(root, "nginx"), []byte("#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then\n  echo 'syntax is ok' >&2\nelse\n  echo 'signal process started' >&2\nfi\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{}
+	output, err := runtime.TestOutput(context.Background())
+	if err != nil || !strings.Contains(output, "syntax is ok") {
+		t.Fatalf("nginx -t output = %q, error = %v", output, err)
+	}
+	output, err = runtime.ReloadOutput(context.Background())
+	if err != nil || !strings.Contains(output, "signal process started") {
+		t.Fatalf("nginx reload output = %q, error = %v", output, err)
+	}
+}

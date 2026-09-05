@@ -610,13 +610,13 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 		return fsutil.Switch(base, rec.Candidate.Link)
 	})
 	if e == nil {
-		e = r.step(critical, st, rec, "nginx_test", r.runtime.Test)
+		e = r.stepWithOutput(critical, st, rec, "nginx_test", r.nginxTest)
 		if e != nil {
 			return r.restore(t, st, rec, "NGINX_TEST_FAILED", e)
 		}
 	}
 	if e == nil {
-		e = r.step(critical, st, rec, "reload", r.runtime.Reload)
+		e = r.stepWithOutput(critical, st, rec, "reload", r.nginxReload)
 		if e != nil {
 			return r.restore(t, st, rec, "NGINX_RELOAD_FAILED", e)
 		}
@@ -635,6 +635,12 @@ func (r *Runner) Apply(ctx context.Context, req release.ApplyRequest) release.Re
 	return r.commit(t, st, rec)
 }
 func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Record, name string, fn func(context.Context) error) error {
+	return r.stepWithOutput(ctx, st, rec, name, func(c context.Context) (string, error) {
+		return "", fn(c)
+	})
+}
+
+func (r *Runner) stepWithOutput(ctx context.Context, st *state.TargetState, rec *state.Record, name string, fn func(context.Context) (string, error)) error {
 	rec.Result.Phase = name
 	if e := r.save(st); e != nil {
 		return e
@@ -642,19 +648,26 @@ func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Rec
 	started := time.Now()
 	stepCtx, cancel := context.WithTimeout(ctx, r.cfg.StepTimeout.Value())
 	defer cancel()
+	output := ""
 	err := stepCtx.Err()
 	if err == nil {
-		err = fn(stepCtx)
+		output, err = fn(stepCtx)
 	}
+	output = commandOutput(output, err)
 	status := release.NodeStatusSucceeded
-	message := ""
+	message := output
 	if err != nil {
 		status = release.NodeStatusFailed
-		message = err.Error()
+		if message == "" {
+			message = err.Error()
+		}
 	}
 	rec.Result.Steps = append(rec.Result.Steps, release.Step{Name: name, Status: status, Message: message, StartedAt: started.UTC(), DurationMS: time.Since(started).Milliseconds()})
 	prom.Step(st.Target.Env, string(st.Target.Type), st.Target.ID, name, string(status), time.Since(started))
 	fields := map[string]any{"env": rec.Request.Env, "node_id": r.cfg.NodeID, "release_id": rec.Request.ReleaseID, "target_id": st.Target.ID, "step": name, "status": status, "duration_ms": time.Since(started).Milliseconds()}
+	if output != "" {
+		fields["command_output"] = output
+	}
 	if err != nil {
 		fields["error"] = message
 		applog.LogError("发布步骤失败", "release_step", fields)
@@ -662,6 +675,47 @@ func (r *Runner) step(ctx context.Context, st *state.TargetState, rec *state.Rec
 		applog.LogInfo("发布步骤完成", "release_step", fields)
 	}
 	return err
+}
+
+func (r *Runner) nginxTest(ctx context.Context) (string, error) {
+	if reporter, ok := r.runtime.(NginxCommandReporter); ok {
+		output, err := reporter.TestOutput(ctx)
+		return nginxCommandOutput("nginx -t", output, err), err
+	}
+	err := r.runtime.Test(ctx)
+	return nginxCommandOutput("nginx -t", "", err), err
+}
+
+func (r *Runner) nginxReload(ctx context.Context) (string, error) {
+	if reporter, ok := r.runtime.(NginxCommandReporter); ok {
+		output, err := reporter.ReloadOutput(ctx)
+		return nginxCommandOutput("nginx -s reload", output, err), err
+	}
+	err := r.runtime.Reload(ctx)
+	return nginxCommandOutput("nginx -s reload", "", err), err
+}
+
+func nginxCommandOutput(command, output string, err error) string {
+	output = strings.TrimSpace(output)
+	if output != "" {
+		return command + " output: " + output
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return command + " succeeded"
+}
+
+func commandOutput(output string, err error) string {
+	output = strings.TrimSpace(output)
+	if output == "" || err != nil && output == err.Error() {
+		return output
+	}
+	const maxOutputBytes = 8192
+	if len(output) > maxOutputBytes {
+		return output[:maxOutputBytes] + " [truncated]"
+	}
+	return output
 }
 func (r *Runner) verify(ctx context.Context, t config.Target, base *os.Root, v *state.Version) error {
 	commit := ""
@@ -806,10 +860,10 @@ func (r *Runner) restoreLocal(ctx context.Context, t config.Target, base *os.Roo
 	if e := fsutil.Switch(base, rec.BeforeLink); e != nil {
 		return e
 	}
-	if e := r.runtime.Test(ctx); e != nil {
+	if _, e := r.nginxTest(ctx); e != nil {
 		return e
 	}
-	if e := r.runtime.Reload(ctx); e != nil {
+	if _, e := r.nginxReload(ctx); e != nil {
 		return e
 	}
 	return r.verify(ctx, t, base, rec.Baseline)
@@ -845,10 +899,10 @@ func (r *Runner) recoverStartup(ctx context.Context, t config.Target, st *state.
 	}
 	if rec.Candidate != nil && link == rec.Candidate.Link {
 		if _, e = verifySnapshot(ctx, base, rec.Candidate); e == nil {
-			e = r.runtime.Test(ctx)
+			_, e = r.nginxTest(ctx)
 		}
 		if e == nil {
-			e = r.runtime.Reload(ctx)
+			_, e = r.nginxReload(ctx)
 		}
 		if e == nil {
 			e = r.verify(ctx, t, base, rec.Candidate)

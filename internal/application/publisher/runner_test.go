@@ -252,6 +252,22 @@ func TestGitSnapshotAddsServerNameForFlattenedExport(t *testing.T) {
 		t.Fatalf("flattened Git export was not placed below server_name: %v", err)
 	}
 }
+
+func TestSuccessfulNginxStepsReportCommands(t *testing.T) {
+	f := newFixture(t)
+	result := f.r.Apply(context.Background(), f.request(f.commit("A")))
+	if result.Status != release.NodeStatusSucceeded {
+		t.Fatal(result)
+	}
+	messages := map[string]string{}
+	for _, step := range result.Steps {
+		messages[step.Name] = step.Message
+	}
+	if messages["nginx_test"] != "nginx -t succeeded" || messages["reload"] != "nginx -s reload succeeded" {
+		t.Fatalf("nginx command messages = %#v", messages)
+	}
+}
+
 func TestReloadFailureRestoresAndRetryIsNotSkipped(t *testing.T) {
 	f := newFixture(t)
 	a := f.commit("A")

@@ -19,6 +19,14 @@ type Runtime interface {
 	Verify(context.Context, config.Target, string, bool) error
 }
 
+// NginxCommandReporter is implemented by runtimes that retain the standard
+// output/error text emitted by nginx commands. The runner uses it to expose
+// command diagnostics in both service logs and the HTTP release result.
+type NginxCommandReporter interface {
+	TestOutput(context.Context) (string, error)
+	ReloadOutput(context.Context) (string, error)
+}
+
 // Probe old assets as well: a route accidentally rooted at latest/assets must fail
 // activation before it can strand browsers that loaded the previous index.
 func (r *Runner) verifyRetainedAssets(ctx context.Context, t config.Target, base *os.Root, st *state.TargetState, current *state.Record) error {

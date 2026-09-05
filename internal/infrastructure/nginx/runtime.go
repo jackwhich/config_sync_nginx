@@ -20,18 +20,28 @@ import (
 type Runtime struct{}
 
 func (n *Runtime) Test(ctx context.Context) error {
-	_, err := process.Run(ctx, "", nil, nil, "nginx", "-t")
+	_, err := n.TestOutput(ctx)
+	return err
+}
+
+func (n *Runtime) TestOutput(ctx context.Context) (string, error) {
+	out, err := process.Run(ctx, "", nil, nil, "nginx", "-t")
 	if err != nil {
-		return fmt.Errorf("nginx -t: %w", err)
+		return out, fmt.Errorf("nginx -t: %w", err)
 	}
-	return nil
+	return out, nil
 }
 func (n *Runtime) Reload(ctx context.Context) error {
-	_, err := process.Run(ctx, "", nil, nil, "nginx", "-s", "reload")
+	_, err := n.ReloadOutput(ctx)
+	return err
+}
+
+func (n *Runtime) ReloadOutput(ctx context.Context) (string, error) {
+	out, err := process.Run(ctx, "", nil, nil, "nginx", "-s", "reload")
 	if err != nil {
-		return fmt.Errorf("nginx -s reload: %w", err)
+		return out, fmt.Errorf("nginx -s reload: %w", err)
 	}
-	return nil
+	return out, nil
 }
 func (n *Runtime) Verify(ctx context.Context, t config.Target, commit string, initial bool) error {
 	checks := t.HealthChecks

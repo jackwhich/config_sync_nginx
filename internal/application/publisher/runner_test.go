@@ -174,11 +174,11 @@ func TestReleaseLifecycleIdempotencyAndABA(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, "releases")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("config release unexpectedly created releases directory: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site", "site.conf")); err != nil {
-		t.Fatalf("Git server directory was not preserved in snapshot: %v", err)
+	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site.conf")); err != nil {
+		t.Fatalf("snapshot content missing at commit root: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site.conf")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Git server directory was unexpectedly flattened: %v", err)
+	if _, err := os.Stat(filepath.Join(f.cfg.Targets[0].Dir, a, "site")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot unexpectedly kept nested server_name directory: %v", err)
 	}
 	replay := f.r.Apply(context.Background(), req)
 	if !replay.Replayed || replay.StateRevisionAfter != res.StateRevisionAfter {
@@ -241,7 +241,7 @@ func TestLegacyBaselineLinkMigratesToDirectSnapshot(t *testing.T) {
 	}
 }
 
-func TestGitSnapshotAddsServerNameForFlattenedExport(t *testing.T) {
+func TestGitSnapshotWritesSiteContentsAtCommitRoot(t *testing.T) {
 	work := t.TempDir()
 	if err := os.WriteFile(filepath.Join(work, "site.conf"), []byte("server {}"), 0644); err != nil {
 		t.Fatal(err)
@@ -259,8 +259,36 @@ func TestGitSnapshotAddsServerNameForFlattenedExport(t *testing.T) {
 	if version.Link != commit {
 		t.Fatalf("snapshot link = %q", version.Link)
 	}
-	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site", "site.conf")); err != nil {
-		t.Fatalf("flattened Git export was not placed below server_name: %v", err)
+	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site.conf")); err != nil {
+		t.Fatalf("flattened Git export was not written at commit root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot unexpectedly kept nested server_name: %v", err)
+	}
+}
+
+func TestGitSnapshotUnwrapsServerNameDirectory(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "site"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "site", "site.conf"), []byte("server {}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pathDest, err := fsutil.Canonical(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := config.Target{Type: release.ReleaseTypeConfig, ServerName: "site", PathDest: pathDest, FileMode: "0644"}
+	commit := strings.Repeat("b", 40)
+	if _, err := prepareSnapshot(context.Background(), config.Config{MaxArchiveBytes: 1 << 20, MaxArchiveFiles: 10}, target, work, commit, "file:///repo", commit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site.conf")); err != nil {
+		t.Fatalf("server_name contents were not unwrapped to commit root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target.PathDest, "config", "site", commit, "site")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot unexpectedly kept nested server_name: %v", err)
 	}
 }
 
@@ -644,7 +672,7 @@ func TestDriftAndCorruptSnapshotDoNotSkip(t *testing.T) {
 	a := f.commit("A")
 	f.apply(a)
 	target := f.cfg.Targets[0]
-	if e := os.WriteFile(filepath.Join(target.Dir, a, "site", "site.conf"), []byte("changed"), 0644); e != nil {
+	if e := os.WriteFile(filepath.Join(target.Dir, a, "site.conf"), []byte("changed"), 0644); e != nil {
 		t.Fatal(e)
 	}
 	got := f.r.Apply(context.Background(), f.request(a))

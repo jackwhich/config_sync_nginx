@@ -173,7 +173,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 			return nil, e
 		}
 	}
-	if m, e := loadManifest(base, commit); e == nil {
+	if m, e := loadManifest(base, commit); e == nil && !legacyNestedServerSnapshot(m, t) {
 		link, e := existingSnapshotLink(base, commit)
 		if e == nil {
 			v := &state.Version{CommitID: commit, Version: version, Source: source, ArtifactDigest: artifactDigest(source), Link: link, ManifestDigest: manifestDigest(m)}
@@ -186,7 +186,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		} else if !errors.Is(e, os.ErrNotExist) {
 			return nil, e
 		}
-	} else if !errors.Is(e, os.ErrNotExist) {
+	} else if e != nil && !errors.Is(e, os.ErrNotExist) {
 		return nil, e
 	}
 	if link, e := existingSnapshotLink(base, commit); e == nil {
@@ -201,13 +201,10 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, e
 	}
 	defer src.Close()
-	// Preserve the Git server_name directory inside config/whitelist snapshots.
-	// Git archive has differed across older client versions: some exports retain
-	// the requested directory and some flatten it. Normalize both forms so the
-	// deployment layout is always <hash>/<server_name>/... . Frontend artifacts
-	// keep their existing flat layout for Nginx root compatibility.
+	// Git keeps sites under server_name/. Checkout may retain that directory or
+	// flatten it. Always write site contents directly under <hash>/ so Nginx
+	// can include latest/*.conf without an extra server_name layer.
 	sourceRoot := src
-	outputPrefix := ""
 	if t.Type == release.ReleaseTypeFrontendStatic {
 		sourceRoot, e = src.OpenRoot(t.ServerName)
 		if e != nil {
@@ -215,7 +212,6 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		}
 		defer sourceRoot.Close()
 	} else {
-		outputPrefix = t.ServerName
 		info, err := src.Lstat(t.ServerName)
 		if err == nil {
 			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -257,17 +253,13 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if name == "." {
 			return nil
 		}
-		outputName := name
-		if outputPrefix != "" {
-			outputName = path.Join(outputPrefix, name)
-		}
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symlinks prohibited")
 		}
 		if d.IsDir() {
-			return fsutil.EnsureDirs(dst, outputName, 0755)
+			return fsutil.EnsureDirs(dst, name, 0755)
 		}
-		if outputName == ".release-version" {
+		if name == ".release-version" {
 			return fmt.Errorf("reserved .release-version file")
 		}
 		if t.Type == release.ReleaseTypeFrontendStatic && t.SharedAssets && name == "frontend-manifest.json" {
@@ -285,10 +277,10 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		if err = ensureSpace(base, c.MinFreeBytes+uint64(f.Size)); err != nil {
 			return err
 		}
-		if err = fsutil.CopyFile(ctx, sourceRoot, dst, name, outputName, t.Mode()); err != nil {
+		if err = fsutil.CopyFile(ctx, sourceRoot, dst, name, name, t.Mode()); err != nil {
 			return err
 		}
-		m.Files[outputName] = f
+		m.Files[name] = f
 		return nil
 	})
 	if e != nil {
@@ -298,7 +290,7 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 		return nil, fmt.Errorf("empty site")
 	}
 	for _, name := range t.RequiredFiles {
-		if _, ok := m.Files[requiredSnapshotPath(t, name)]; !ok {
+		if _, ok := m.Files[name]; !ok {
 			return nil, fmt.Errorf("required file missing: %s", name)
 		}
 	}
@@ -342,11 +334,22 @@ func prepareSnapshot(ctx context.Context, c config.Config, t config.Target, work
 	return v, nil
 }
 
-func requiredSnapshotPath(t config.Target, name string) string {
-	if t.Type == release.ReleaseTypeFrontendStatic {
-		return name
+// legacyNestedServerSnapshot detects older config/whitelist snapshots that
+// stored files under <hash>/<server_name>/ instead of directly under <hash>/.
+func legacyNestedServerSnapshot(m *state.Manifest, t config.Target) bool {
+	if t.Type == release.ReleaseTypeFrontendStatic || t.ServerName == "" || m == nil {
+		return false
 	}
-	return path.Join(t.ServerName, name)
+	prefix := t.ServerName + "/"
+	for name := range m.Files {
+		if name == ".release-version" {
+			continue
+		}
+		if strings.HasPrefix(name, prefix) || name == t.ServerName {
+			return true
+		}
+	}
+	return false
 }
 
 // existingSnapshotLink accepts the former releases/<commit> layout only to

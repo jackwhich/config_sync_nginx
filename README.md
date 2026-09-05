@@ -74,13 +74,12 @@ go build -o bin/nginx_updata_config ./cmd/nginx_updata_config
   .staging/stage-<随机 UUID>/
   .manifests/<完整 commit>.json
   <完整 commit>/
-    <server_name>/
-      site.conf
+    site.conf
     .release-version
   latest -> <完整 commit>
 ```
 
-Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/ybf-uat-nginx/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest/<server_name>` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。
+Nginx 原有主配置需显式 include 对应目标，例如在正确的 `http` 或 `server` 上下文中引用 `/data/nginx-publish/config/ybf-uat-nginx/latest/*.conf`；仓库制品的语法上下文必须与 include 位置一致。`whitelist` 同样引用其 `latest/` 内具体文件。服务不会修改 Nginx 主配置或自动猜测 include 位置。
 
 Git 类型使用完整 40/64 位提交 ID；本次分支由 POST 顶层 `branch` 传入，服务验证提交位于该分支历史中。默认配置只填写仓库 URL 和凭据。拉取优先使用 Git partial clone 的 `blob:none` 过滤：先获取分支的提交和目录元数据，`git archive` 仅按需取回当前站点目录的文件；GitLab 或节点 Git 客户端不支持该协议时，会自动退回普通 fetch。高级可选项 `allowed_branches` 是额外的分支允许列表，不代替请求 branch；未传 branch 时检查提交在仓库允许分支上可达。前端使用完整 Git SHA，可由服务解析为固定 OCI digest，路径见后面的前端章节。`version` 仅用于展示。归档拒绝符号链接、硬链接、绝对路径和穿越路径，设有大小、文件数、执行时间限制。相同提交的快照经过清单校验后复用，不能原地改写。
 

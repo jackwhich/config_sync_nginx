@@ -59,7 +59,7 @@ X-Release-Token: <uat 对应的 Token>
 
 commit_id 必须为完整 40/64 位提交 ID，兼容 `commitid`。站点和目录推荐使用 params；兼容顶层 server_name/path_dest 以及 servee_name 拼写别名，重复提供不同值会报错。
 
-Git 发布按请求中的 `branch` 拉取对应分支，确认 `commit_id` 位于该分支的提交历史中，再导出指定提交下的 server_name 目录。该 Git 目录会原样保留在 hash 快照内，即路径为 `<path_dest>/<type>/<server_name>/latest/<server_name>/...`。`env` 用于环境认证，`branch` 用于选择 Git 分支，两者独立，不会把 env 当成分支名。
+Git 发布按请求中的 `branch` 拉取对应分支，确认 `commit_id` 位于该分支的提交历史中，再导出指定提交下的 server_name 目录内容到 `<path_dest>/<type>/<server_name>/latest/`（commit 目录内不再套一层 server_name）。`env` 用于环境认证，`branch` 用于选择 Git 分支，两者独立，不会把 env 当成分支名。
 
 `allowed_branches` 是高级配置中可选的分支允许列表，只负责限制请求能使用哪些分支，不代替请求中的 `branch`。默认示例不配置此项；若显式配置，传入的 branch 还必须在列表内。为兼容仅传 commit_id 的调用，branch 仍可省略：此时检查提交在仓库某个允许分支上可达。
 
